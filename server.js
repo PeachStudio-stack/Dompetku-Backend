@@ -99,15 +99,8 @@ Rules:
 3) Keep data-entry replies very short (1-2 sentences).
 4) For analysis, use neat sections: Judul, Summary, Detail, Insight, Rekomendasi.
 5) Response language must be ${targetLanguage}.
-6) If changing data, include ONLY this JSON patch format inside \`\`\`json ... \`\`\`:
-{
-  "balanceUpdates": [{"section":"expenses","name":"Makan & Minum","value":25000}],
-  "budgetUpdates": [{"name":"Makan & Minum","spent":25000,"limit":1500000}],
-  "goalUpdates": [{"name":"Dana Darurat","current":500000,"target":10000000}],
-  "newTransactions": [{"id":"tx_123","date":"2026-05-15","description":"Beli makan","amount":25000,"type":"expense","category":"Makan & Minum","account":"Cash"}]
-}
-7) Transaction type must be one of: income, expense, saving, debt_payment, asset.
-8) Numbers must be plain JSON numbers only. Do not use + sign prefix, no math expressions.
+6) Numbers and examples should be clear and simple for end users.
+7) Do not output JSON patch blocks. Reply in natural language only.
 Compact context:
 ${JSON.stringify(compactData)}`;
 
@@ -412,7 +405,9 @@ app.post("/api/chat", async (req, res) => {
       console.warn("Primary model failed, fallback used:", String(error));
     }
 
-    const { finalData, textWithoutJson } = applyPatch(currentData || {}, aiText);
+    const textWithoutJson = String(aiText || "")
+      .replace(/\`\`\`json\n?[\s\S]*?\n?\`\`\`/g, "")
+      .trim();
     console.log(
       "[latency]",
       JSON.stringify({
@@ -425,7 +420,16 @@ app.post("/api/chat", async (req, res) => {
         fallback_used: fallbackUsed,
       })
     );
-    res.json({ text: textWithoutJson, updatedData: finalData });
+    res.json({
+      text: textWithoutJson,
+      metadata: {
+        processing_mode: "ai_proxy",
+        model_used: usedModel,
+        fallback_used: fallbackUsed,
+        ttft_ms: timing.ttftMs,
+        total_ms: Date.now() - started,
+      },
+    });
   } catch (error) {
     console.error("AI Proxy Error:", error);
     res.status(500).json({ error: error?.message || "Unknown error" });
@@ -488,7 +492,9 @@ app.post("/api/chat/stream", async (req, res) => {
       console.warn("Primary stream failed, fallback used:", String(error));
     }
 
-    const { finalData, textWithoutJson } = applyPatch(currentData || {}, fullText);
+    const textWithoutJson = String(fullText || "")
+      .replace(/\`\`\`json\n?[\s\S]*?\n?\`\`\`/g, "")
+      .trim();
     console.log(
       "[latency]",
       JSON.stringify({
@@ -504,8 +510,8 @@ app.post("/api/chat/stream", async (req, res) => {
 
     sendEvent("done", {
       fullText: textWithoutJson,
-      updatedData: finalData,
       metadata: {
+        processing_mode: "ai_proxy",
         model_used: usedModel,
         fallback_used: fallbackUsed,
         ttft_ms: ttftMs,
