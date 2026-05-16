@@ -14,6 +14,104 @@ const OPENROUTER_MODEL_QUICK_SUGGEST =
   process.env.OPENROUTER_MODEL_QUICK_SUGGEST || "deepseek/deepseek-v4-flash:free";
 const OPENROUTER_TIMEOUT_FAST_MS = Number(process.env.OPENROUTER_TIMEOUT_FAST_MS || 12000);
 const OPENROUTER_TIMEOUT_HEAVY_MS = Number(process.env.OPENROUTER_TIMEOUT_HEAVY_MS || 25000);
+const AGENT_ACTION_TOOLS = [
+  {
+    type: "function",
+    function: {
+      name: "createTabungan",
+      description: "Create a savings plan with name and target amount.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          target: { type: "number" },
+        },
+        required: ["name", "target"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "addTabungan",
+      description: "Add savings amount into an existing plan.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          amount: { type: "number" },
+          note: { type: "string" },
+          date: { type: "string" },
+        },
+        required: ["name", "amount"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "createBudget",
+      description: "Create a budget and define its limit.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          limit: { type: "number" },
+        },
+        required: ["name", "limit"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "updateBudget",
+      description: "Update budget limit for an existing budget name.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          limit: { type: "number" },
+        },
+        required: ["name", "limit"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "addTransaction",
+      description: "Record a financial transaction.",
+      parameters: {
+        type: "object",
+        properties: {
+          type: { type: "string", enum: ["income", "expense", "saving", "debt_payment", "asset"] },
+          amount: { type: "number" },
+          category: { type: "string" },
+          description: { type: "string" },
+          date: { type: "string" },
+        },
+        required: ["type", "amount"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "createGoal",
+      description: "Create or update savings goal with target and current.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          target: { type: "number" },
+          current: { type: "number" },
+        },
+        required: ["name", "target"],
+      },
+    },
+  },
+];
 
 const ALLOWED_ORIGINS = String(process.env.CORS_ALLOWED_ORIGINS || "")
   .split(",")
@@ -79,6 +177,7 @@ const buildCompactData = (currentData) => ({
     assets: compactObject(currentData?.assets || currentData?.accounts?.assets || {}),
     budgets: currentData?.budgets || {},
     goals: currentData?.goals || {},
+    tabunganPlans: currentData?.tabunganPlans || {},
   },
   recentTransactions: Array.isArray(currentData?.transactions)
     ? currentData.transactions.slice(-20).map((tx) => ({
@@ -101,6 +200,19 @@ Rules:
 5) Response language must be ${targetLanguage}.
 6) Numbers and examples should be clear and simple for end users.
 7) Do not output JSON patch blocks. Reply in natural language only.
+Compact context:
+${JSON.stringify(compactData)}`;
+
+const buildActionSystemInstruction = (targetLanguage, compactData) => `You are a personal-finance action planner.
+Return tool calls only for state-changing intent. Do not output JSON patch text.
+Rules:
+1) Use only available tools.
+2) For budget progress/spent updates, never set spent directly. Use transactions for spending.
+3) Prefer accurate Indonesian-friendly naming for budget and tabungan plan.
+4) You may call multiple tools when needed.
+5) If user asks pure analysis/advice without mutation intent, do not call tools.
+6) Response language: ${targetLanguage}.
+
 Compact context:
 ${JSON.stringify(compactData)}`;
 
@@ -291,6 +403,56 @@ const callOpenRouterText = async (params) => {
   return { text, ttftMs: Date.now() - startedAt, totalMs: Date.now() - startedAt };
 };
 
+const callOpenRouterActions = async (params) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), params.timeoutMs);
+  try {
+    const response = await fetch(OPENROUTER_URL, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": params.referer || "http://localhost:3000",
+        "X-Title": "Dompetku BackendOnly Actions",
+      },
+      body: JSON.stringify({
+        model: params.model,
+        temperature: 0,
+        max_tokens: 320,
+        messages: params.messages,
+        tools: AGENT_ACTION_TOOLS,
+        tool_choice: params.toolChoice,
+      }),
+    });
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error(`OpenRouter Error ${response.status}: ${err}`);
+    }
+    const data = await response.json();
+    const message = data?.choices?.[0]?.message || {};
+    const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+    const actions = toolCalls
+      .map((item) => {
+        const name = String(item?.function?.name || "");
+        if (!name) return null;
+        const argRaw = String(item?.function?.arguments || "{}");
+        let args = {};
+        try {
+          args = JSON.parse(argRaw);
+        } catch {
+          args = {};
+        }
+        return { name, args };
+      })
+      .filter(Boolean);
+    const assistantText = typeof message?.content === "string" ? message.content : "";
+    return { actions, assistantText };
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
 const streamOpenRouterText = async (params) => {
   const startedAt = Date.now();
   let firstTokenAt = 0;
@@ -359,6 +521,103 @@ app.get("/health", (_req, res) => {
       heavy: OPENROUTER_MODEL_HEAVY,
     },
   });
+});
+
+app.post("/api/agent/actions", async (req, res) => {
+  const started = Date.now();
+  try {
+    const { prompt, currentData, language } = req.body || {};
+    const safePrompt = String(prompt || "").trim();
+    if (!safePrompt) {
+      return res.status(400).json({
+        ok: false,
+        error: "Prompt tidak boleh kosong.",
+        actions: [],
+        assistantText: "",
+      });
+    }
+
+    const targetLanguage = String(language || "Indonesian");
+    const { primary, secondary, primaryTimeout, secondaryTimeout } = resolveModelPlan(safePrompt);
+    const compactData = buildCompactData(currentData || {});
+    const actionSystem = buildActionSystemInstruction(targetLanguage, compactData);
+    const messages = [
+      { role: "system", content: actionSystem },
+      { role: "user", content: safePrompt },
+    ];
+
+    let usedModel = primary;
+    let fallbackUsed = false;
+    let retryForced = false;
+    let result = await callOpenRouterActions({
+      model: primary,
+      timeoutMs: primaryTimeout,
+      messages,
+      referer: req.headers.referer,
+      toolChoice: "auto",
+    });
+
+    if (!result.actions.length) {
+      retryForced = true;
+      result = await callOpenRouterActions({
+        model: primary,
+        timeoutMs: primaryTimeout,
+        messages,
+        referer: req.headers.referer,
+        toolChoice: "required",
+      });
+    }
+
+    if (!result.actions.length) {
+      fallbackUsed = true;
+      usedModel = secondary;
+      result = await callOpenRouterActions({
+        model: secondary,
+        timeoutMs: secondaryTimeout,
+        messages,
+        referer: req.headers.referer,
+        toolChoice: "required",
+      });
+    }
+
+    if (!result.actions.length) {
+      return res.status(422).json({
+        ok: false,
+        actions: [],
+        assistantText: "",
+        error:
+          "Aksi belum terbaca jelas. Coba tulis lebih spesifik, contoh: 'Tambah tabungan mobil 500rb' atau 'Catat makan 25rb'.",
+        metadata: {
+          processing_mode: "ai_actions",
+          model_used: usedModel,
+          fallback_used: fallbackUsed,
+          retry_forced_tool_choice: retryForced,
+          total_ms: Date.now() - started,
+        },
+      });
+    }
+
+    return res.json({
+      ok: true,
+      actions: result.actions,
+      assistantText: result.assistantText?.trim() || "Siap, perubahan data keuangan sudah saya susun.",
+      metadata: {
+        processing_mode: "ai_actions",
+        model_used: usedModel,
+        fallback_used: fallbackUsed,
+        retry_forced_tool_choice: retryForced,
+        total_ms: Date.now() - started,
+      },
+    });
+  } catch (error) {
+    console.error("Agent Actions Error:", error);
+    return res.status(500).json({
+      ok: false,
+      actions: [],
+      assistantText: "",
+      error: error?.message || "Agent action request failed.",
+    });
+  }
 });
 
 app.post("/api/chat", async (req, res) => {
