@@ -18,6 +18,40 @@ const AGENT_ACTION_TOOLS = [
   {
     type: "function",
     function: {
+      name: "AddAkunDompet",
+      description: "Tambah akun dompet baru dengan saldo awal opsional.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          type: { type: "string" },
+          saldo_awal: { type: "number" },
+          startingBalance: { type: "number" },
+        },
+        required: ["name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "createWallet",
+      description: "Create a wallet/account with optional starting balance.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          type: { type: "string" },
+          saldo_awal: { type: "number" },
+          startingBalance: { type: "number" },
+        },
+        required: ["name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "createTabungan",
       description: "Create a savings plan with name and target amount.",
       parameters: {
@@ -40,10 +74,14 @@ const AGENT_ACTION_TOOLS = [
         properties: {
           name: { type: "string" },
           amount: { type: "number" },
+          jumlah: { type: "number" },
           note: { type: "string" },
+          catatan: { type: "string" },
+          account: { type: "string" },
           date: { type: "string" },
+          tanggal: { type: "string" },
         },
-        required: ["name", "amount"],
+        required: ["name"],
       },
     },
   },
@@ -87,11 +125,20 @@ const AGENT_ACTION_TOOLS = [
         properties: {
           type: { type: "string", enum: ["income", "expense", "saving", "debt_payment", "asset"] },
           amount: { type: "number" },
+          jumlah: { type: "number" },
           category: { type: "string" },
+          kategori: { type: "string" },
           description: { type: "string" },
+          catatan: { type: "string" },
+          source: { type: "string" },
+          sumber: { type: "string" },
+          method: { type: "string" },
+          metode: { type: "string" },
+          account: { type: "string" },
           date: { type: "string" },
+          tanggal: { type: "string" },
         },
-        required: ["type", "amount"],
+        required: ["type"],
       },
     },
   },
@@ -178,6 +225,7 @@ const buildCompactData = (currentData) => ({
     budgets: currentData?.budgets || {},
     goals: currentData?.goals || {},
     tabunganPlans: currentData?.tabunganPlans || {},
+    wallets: currentData?.wallets || {},
   },
   recentTransactions: Array.isArray(currentData?.transactions)
     ? currentData.transactions.slice(-20).map((tx) => ({
@@ -208,10 +256,17 @@ Return tool calls only for state-changing intent. Do not output JSON patch text.
 Rules:
 1) Use only available tools.
 2) For budget progress/spent updates, never set spent directly. Use transactions for spending.
-3) Prefer accurate Indonesian-friendly naming for budget and tabungan plan.
-4) You may call multiple tools when needed.
-5) If user asks pure analysis/advice without mutation intent, do not call tools.
-6) Response language: ${targetLanguage}.
+3) Every transaction should include an account wallet when possible.
+4) Never fabricate money movement if funds are clearly insufficient; choose suitable wallet.
+5) Prefer accurate Indonesian-friendly naming for budget, tabungan plan, and wallet.
+6) Use AddAkunDompet when user asks to add/create wallet account.
+7) For income transaction, prefer fields: tanggal, jumlah, kategori, sumber, catatan.
+8) For expense transaction, prefer fields: tanggal, jumlah, kategori, metode, catatan.
+9) If amount is missing, set default amount to 17000.
+10) If date is missing, still send transaction and let app use local today's date.
+11) You may call multiple tools when needed.
+12) If user asks pure analysis/advice without mutation intent, do not call tools.
+13) Response language: ${targetLanguage}.
 
 Compact context:
 ${JSON.stringify(compactData)}`;
