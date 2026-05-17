@@ -160,10 +160,20 @@ const AGENT_ACTION_TOOLS = [
   },
 ];
 
-const ALLOWED_ORIGINS = String(process.env.CORS_ALLOWED_ORIGINS || "")
-  .split(",")
-  .map((v) => v.trim())
-  .filter(Boolean);
+const DEFAULT_ALLOWED_ORIGINS = [
+  "http://localhost",
+  "http://localhost:3000",
+  "capacitor://localhost",
+];
+const ALLOWED_ORIGINS = Array.from(
+  new Set([
+    ...DEFAULT_ALLOWED_ORIGINS,
+    ...String(process.env.CORS_ALLOWED_ORIGINS || "")
+      .split(",")
+      .map((v) => v.trim())
+      .filter(Boolean),
+  ])
+);
 
 const isObject = (value) => typeof value === "object" && value !== null;
 const estimateTokens = (text) => Math.ceil(String(text || "").length / 4);

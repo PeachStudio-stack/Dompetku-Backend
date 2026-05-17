@@ -37,7 +37,7 @@ Contoh:
 NODE_ENV=production
 PORT=3000
 OPENROUTER_API_KEY=sk-or-v1-xxxx
-CORS_ALLOWED_ORIGINS=http://localhost:3000,capacitor://localhost,https://app.domainkamu.com
+CORS_ALLOWED_ORIGINS=http://localhost,http://localhost:3000,capacitor://localhost,https://app.domainkamu.com
 ```
 
 ## 4) Jalankan dengan PM2
