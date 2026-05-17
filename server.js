@@ -9,11 +9,32 @@ const PORT = Number(process.env.PORT || 3000);
 const OPENROUTER_URL = process.env.OPENROUTER_URL || "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const OPENROUTER_MODEL_FAST = process.env.OPENROUTER_MODEL_FAST || "deepseek/deepseek-chat";
-const OPENROUTER_MODEL_HEAVY = process.env.OPENROUTER_MODEL_HEAVY || "deepseek/deepseek-v3.2";
+const OPENROUTER_MODEL_HEAVY = process.env.OPENROUTER_MODEL_HEAVY || "deepseek/deepseek-v4-flash:exacto";
 const OPENROUTER_MODEL_QUICK_SUGGEST =
-  process.env.OPENROUTER_MODEL_QUICK_SUGGEST || "deepseek/deepseek-v4-flash:free";
+  process.env.OPENROUTER_MODEL_QUICK_SUGGEST || "openrouter/free";
+const OPENROUTER_MODEL_FREE = process.env.OPENROUTER_MODEL_FREE || "openrouter/free";
+const OPENROUTER_MODEL_REPORT_RECOMMENDATION =
+  process.env.OPENROUTER_MODEL_REPORT_RECOMMENDATION || "openrouter/free";
 const OPENROUTER_TIMEOUT_FAST_MS = Number(process.env.OPENROUTER_TIMEOUT_FAST_MS || 12000);
 const OPENROUTER_TIMEOUT_HEAVY_MS = Number(process.env.OPENROUTER_TIMEOUT_HEAVY_MS || 25000);
+const hasOpenRouterKey = () => Boolean(OPENROUTER_API_KEY.trim());
+const assertOpenRouterKey = () => {
+  if (!hasOpenRouterKey()) {
+    throw new Error("Server AI belum membaca OPENROUTER_API_KEY.");
+  }
+};
+const logAiRoute = (route, details = {}) => {
+  console.log(
+    "[ai-route]",
+    JSON.stringify({
+      route,
+      hasOpenRouterKey: hasOpenRouterKey(),
+      modelFree: OPENROUTER_MODEL_FREE,
+      modelReport: OPENROUTER_MODEL_REPORT_RECOMMENDATION,
+      ...details,
+    })
+  );
+};
 const AGENT_ACTION_TOOLS = [
   {
     type: "function",
@@ -162,8 +183,11 @@ const AGENT_ACTION_TOOLS = [
 
 const DEFAULT_ALLOWED_ORIGINS = [
   "http://localhost",
+  "https://localhost",
   "http://localhost:3000",
+  "https://localhost:3000",
   "capacitor://localhost",
+  "ionic://localhost",
 ];
 const ALLOWED_ORIGINS = Array.from(
   new Set([
@@ -174,6 +198,19 @@ const ALLOWED_ORIGINS = Array.from(
       .filter(Boolean),
   ])
 );
+const LOCALHOST_ORIGIN_PROTOCOLS = new Set(["http:", "https:", "capacitor:", "ionic:"]);
+
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true;
+  if (ALLOWED_ORIGINS.includes(origin)) return true;
+
+  try {
+    const parsed = new URL(origin);
+    return parsed.hostname === "localhost" && LOCALHOST_ORIGIN_PROTOCOLS.has(parsed.protocol);
+  } catch {
+    return false;
+  }
+};
 
 const isObject = (value) => typeof value === "object" && value !== null;
 const estimateTokens = (text) => Math.ceil(String(text || "").length / 4);
@@ -221,6 +258,21 @@ const resolveModelPlan = (prompt) => {
   return { intent, primary, secondary, primaryTimeout, secondaryTimeout, maxTokens };
 };
 
+const isFreeAccess = (accessPlan) =>
+  !["premium", "paid", "subscribed"].includes(String(accessPlan || "").toLowerCase());
+
+const resolveAccessModelPlan = (prompt, accessPlan) => {
+  const plan = resolveModelPlan(prompt);
+  if (!isFreeAccess(accessPlan)) return plan;
+  return {
+    ...plan,
+    primary: OPENROUTER_MODEL_FREE,
+    secondary: OPENROUTER_MODEL_FREE,
+    primaryTimeout: OPENROUTER_TIMEOUT_FAST_MS,
+    secondaryTimeout: OPENROUTER_TIMEOUT_FAST_MS,
+  };
+};
+
 const compactObject = (obj = {}) =>
   Object.fromEntries(Object.entries(obj).filter(([, value]) => Number(value) !== 0));
 
@@ -239,13 +291,13 @@ const buildCompactData = (currentData) => ({
   },
   recentTransactions: Array.isArray(currentData?.transactions)
     ? currentData.transactions.slice(-20).map((tx) => ({
-        id: tx?.id,
-        date: tx?.date,
-        description: tx?.description,
-        amount: tx?.amount,
-        type: tx?.type,
-        category: tx?.category,
-      }))
+      id: tx?.id,
+      date: tx?.date,
+      description: tx?.description,
+      amount: tx?.amount,
+      type: tx?.type,
+      category: tx?.category,
+    }))
     : [],
 });
 
@@ -428,6 +480,7 @@ const applyPatch = (currentData, aiText) => {
 };
 
 const openRouterFetch = async ({ model, timeoutMs, messages, maxTokens, stream, referer }) => {
+  assertOpenRouterKey();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -469,6 +522,7 @@ const callOpenRouterText = async (params) => {
 };
 
 const callOpenRouterActions = async (params) => {
+  assertOpenRouterKey();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), params.timeoutMs);
   try {
@@ -568,8 +622,7 @@ app.use(express.json({ limit: "10mb" }));
 app.use(
   cors({
     origin(origin, callback) {
-      if (!origin) return callback(null, true);
-      if (!ALLOWED_ORIGINS.length || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+      if (isAllowedOrigin(origin)) return callback(null, true);
       return callback(new Error(`Origin not allowed: ${origin}`));
     },
   })
@@ -580,18 +633,31 @@ app.get("/health", (_req, res) => {
     ok: true,
     app: "Dompetku-BackendOnly",
     env: process.env.NODE_ENV || "development",
-    openrouterKeyLoaded: Boolean(OPENROUTER_API_KEY),
+    openrouterKeyLoaded: hasOpenRouterKey(),
     models: {
       fast: OPENROUTER_MODEL_FAST,
       heavy: OPENROUTER_MODEL_HEAVY,
+      free: OPENROUTER_MODEL_FREE,
+      report: OPENROUTER_MODEL_REPORT_RECOMMENDATION,
     },
+  });
+});
+
+app.get("/api/health/ai", (_req, res) => {
+  res.json({
+    ok: true,
+    hasOpenRouterKey: hasOpenRouterKey(),
+    modelFree: OPENROUTER_MODEL_FREE,
+    modelReport: OPENROUTER_MODEL_REPORT_RECOMMENDATION,
+    modelQuickSuggest: OPENROUTER_MODEL_QUICK_SUGGEST,
+    nodeEnv: process.env.NODE_ENV || "development",
   });
 });
 
 app.post("/api/agent/actions", async (req, res) => {
   const started = Date.now();
   try {
-    const { prompt, currentData, language } = req.body || {};
+    const { prompt, currentData, language, accessPlan } = req.body || {};
     const safePrompt = String(prompt || "").trim();
     if (!safePrompt) {
       return res.status(400).json({
@@ -603,7 +669,13 @@ app.post("/api/agent/actions", async (req, res) => {
     }
 
     const targetLanguage = String(language || "Indonesian");
-    const { primary, secondary, primaryTimeout, secondaryTimeout } = resolveModelPlan(safePrompt);
+    const { primary, secondary, primaryTimeout, secondaryTimeout } =
+      resolveAccessModelPlan(safePrompt, accessPlan);
+    logAiRoute("/api/agent/actions", {
+      accessPlan: accessPlan || "free",
+      inputChars: safePrompt.length,
+      model: primary,
+    });
     const compactData = buildCompactData(currentData || {});
     const actionSystem = buildActionSystemInstruction(targetLanguage, compactData);
     const messages = [
@@ -688,10 +760,17 @@ app.post("/api/agent/actions", async (req, res) => {
 app.post("/api/chat", async (req, res) => {
   const started = Date.now();
   try {
-    const { prompt, currentData, language } = req.body || {};
+    const { prompt, currentData, language, accessPlan } = req.body || {};
     const targetLanguage = language || "Indonesian";
     const { primary, secondary, primaryTimeout, secondaryTimeout, maxTokens } =
-      resolveModelPlan(prompt || "");
+      resolveAccessModelPlan(prompt || "", accessPlan);
+    const intent = classifyIntent(prompt || "");
+    logAiRoute("/api/chat", {
+      accessPlan: accessPlan || "free",
+      intent,
+      inputChars: String(prompt || "").length,
+      model: primary,
+    });
     const compactData = buildCompactData(currentData || {});
     const systemInstruction = buildSystemInstruction(targetLanguage, compactData);
     const messages = [
@@ -768,10 +847,17 @@ app.post("/api/chat/stream", async (req, res) => {
   };
 
   try {
-    const { prompt, currentData, language } = req.body || {};
+    const { prompt, currentData, language, accessPlan } = req.body || {};
     const targetLanguage = language || "Indonesian";
     const { primary, secondary, primaryTimeout, secondaryTimeout, maxTokens } =
-      resolveModelPlan(prompt || "");
+      resolveAccessModelPlan(prompt || "", accessPlan);
+    const intent = classifyIntent(prompt || "");
+    logAiRoute("/api/chat/stream", {
+      accessPlan: accessPlan || "free",
+      intent,
+      inputChars: String(prompt || "").length,
+      model: primary,
+    });
     const compactData = buildCompactData(currentData || {});
     const systemInstruction = buildSystemInstruction(targetLanguage, compactData);
     const messages = [
@@ -852,7 +938,7 @@ app.post("/api/chat/stream", async (req, res) => {
 
 app.post("/api/quick-suggestions", async (req, res) => {
   try {
-    const { text, language } = req.body || {};
+    const { text, language, accessPlan } = req.body || {};
     const query = String(text || "").trim();
     if (!query) return res.json({ suggestions: [] });
 
@@ -864,9 +950,15 @@ Rules:
 - Practical and directly actionable
 - No numbering, no markdown, no explanation
 - Return valid JSON object only: {"suggestions":["...","...","..."]}`;
+    const usedModel = isFreeAccess(accessPlan) ? OPENROUTER_MODEL_FREE : OPENROUTER_MODEL_QUICK_SUGGEST;
+    logAiRoute("/api/quick-suggestions", {
+      accessPlan: accessPlan || "free",
+      inputChars: query.length,
+      model: usedModel,
+    });
 
     const result = await callOpenRouterText({
-      model: OPENROUTER_MODEL_QUICK_SUGGEST,
+      model: usedModel,
       timeoutMs: 12000,
       maxTokens: 120,
       referer: req.headers.referer,
@@ -890,6 +982,54 @@ Rules:
     return res.json({ suggestions });
   } catch (error) {
     return res.status(503).json({ error: error?.message || "Quick suggestions unavailable" });
+  }
+});
+
+app.post("/api/report/recommendations", async (req, res) => {
+  const started = Date.now();
+  try {
+    const { currentData, language } = req.body || {};
+    const targetLanguage = String(language || "Indonesian");
+    if (!currentData || typeof currentData !== "object") {
+      return res.status(400).json({ error: "Missing currentData." });
+    }
+
+    logAiRoute("/api/report/recommendations", {
+      model: OPENROUTER_MODEL_REPORT_RECOMMENDATION,
+    });
+
+    const result = await callOpenRouterText({
+      model: OPENROUTER_MODEL_REPORT_RECOMMENDATION,
+      timeoutMs: 18000,
+      maxTokens: 220,
+      referer: req.headers.referer,
+      messages: [
+        {
+          role: "user",
+          content: buildReportRecommendationPrompt(targetLanguage, currentData),
+        },
+      ],
+    });
+
+    const aiResult = parseReportAiResult(result.text);
+    if (!aiResult.recommendations.length && aiResult.healthScore === null) {
+      throw new Error("No report AI result returned");
+    }
+
+    return res.json({
+      recommendations: aiResult.recommendations,
+      healthScore: aiResult.healthScore,
+      healthStatus: aiResult.healthStatus,
+      metadata: {
+        processing_mode: "report_recommendation",
+        model_used: OPENROUTER_MODEL_REPORT_RECOMMENDATION,
+        ttft_ms: result.ttftMs,
+        total_ms: Date.now() - started,
+      },
+    });
+  } catch (error) {
+    console.error("Report Recommendation Error:", error);
+    return res.status(503).json({ error: error?.message || "Report recommendations unavailable" });
   }
 });
 

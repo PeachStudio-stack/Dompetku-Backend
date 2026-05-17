@@ -29,7 +29,9 @@ nano .env
 Wajib isi:
 
 - `OPENROUTER_API_KEY` (valid)
-- `CORS_ALLOWED_ORIGINS` (domain frontend kamu + `capacitor://localhost`)
+- `OPENROUTER_MODEL_FREE=openrouter/free`
+- `OPENROUTER_MODEL_REPORT_RECOMMENDATION=openrouter/free`
+- `CORS_ALLOWED_ORIGINS` (domain frontend kamu + origin Capacitor: `http://localhost`, `https://localhost`, `capacitor://localhost`)
 
 Contoh:
 
@@ -37,7 +39,10 @@ Contoh:
 NODE_ENV=production
 PORT=3000
 OPENROUTER_API_KEY=sk-or-v1-xxxx
-CORS_ALLOWED_ORIGINS=http://localhost,http://localhost:3000,capacitor://localhost,https://app.domainkamu.com
+OPENROUTER_MODEL_FREE=openrouter/free
+OPENROUTER_MODEL_REPORT_RECOMMENDATION=openrouter/free
+OPENROUTER_MODEL_QUICK_SUGGEST=openrouter/free
+CORS_ALLOWED_ORIGINS=http://localhost,https://localhost,http://localhost:3000,https://localhost:3000,capacitor://localhost,https://app.domainkamu.com
 ```
 
 ## 4) Jalankan dengan PM2
@@ -68,9 +73,11 @@ pm2 logs Dompetku-BackendOnly --lines 100
 ## Endpoint yang tersedia
 
 - `GET /health`
+- `GET /api/health/ai`
 - `POST /api/chat`
 - `POST /api/chat/stream` (SSE, kompatibel dengan frontend sekarang)
 - `POST /api/quick-suggestions`
+- `POST /api/report/recommendations`
 
 ## Contoh test dari VPS
 
