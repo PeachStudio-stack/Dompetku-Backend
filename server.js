@@ -35,6 +35,13 @@ const logAiRoute = (route, details = {}) => {
     })
   );
 };
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://iygjnjkebhjwvhlmcnng.supabase.co";
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const FINANCE_TABLE = "user_finance_snapshots";
+const RECURRING_RULE_TABLE = "recurring_transaction_rules";
+const RECURRING_RUN_TABLE = "recurring_transaction_runs";
+const DEFAULT_TIMEZONE = "Asia/Jakarta";
+const DEFAULT_ACCOUNT_NAME = "Cash / uang tunai";
 const AGENT_ACTION_TOOLS = [
   {
     type: "function",
@@ -179,6 +186,90 @@ const AGENT_ACTION_TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "createRecurringRule",
+      description: "Create an automatic recurring transaction schedule.",
+      parameters: {
+        type: "object",
+        properties: {
+          amount: { type: "number" },
+          category: { type: "string" },
+          description: { type: "string" },
+          account: { type: "string" },
+          method: { type: "string" },
+          frequency: { type: "string", enum: ["daily", "weekly", "monthly"] },
+          interval: { type: "number" },
+          run_time_local: { type: "string", description: "HH:mm local time" },
+          weekdays: { type: "array", items: { type: "number" } },
+          month_days: { type: "array", items: { type: "number" } },
+          timezone_name: { type: "string" },
+          start_date: { type: "string", description: "YYYY-MM-DD" },
+          end_date: { type: "string", description: "YYYY-MM-DD" },
+          is_active: { type: "boolean" },
+        },
+        required: ["amount", "category", "account", "frequency", "run_time_local"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "updateRecurringRule",
+      description: "Update a recurring transaction schedule.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          amount: { type: "number" },
+          category: { type: "string" },
+          description: { type: "string" },
+          account: { type: "string" },
+          method: { type: "string" },
+          frequency: { type: "string", enum: ["daily", "weekly", "monthly"] },
+          interval: { type: "number" },
+          run_time_local: { type: "string", description: "HH:mm local time" },
+          weekdays: { type: "array", items: { type: "number" } },
+          month_days: { type: "array", items: { type: "number" } },
+          timezone_name: { type: "string" },
+          start_date: { type: "string", description: "YYYY-MM-DD" },
+          end_date: { type: "string", description: "YYYY-MM-DD" },
+          is_active: { type: "boolean" },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "pauseRecurringRule",
+      description: "Pause or resume a recurring transaction schedule.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          is_active: { type: "boolean" },
+        },
+        required: ["id", "is_active"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "deleteRecurringRule",
+      description: "Delete a recurring transaction schedule.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+        },
+        required: ["id"],
+      },
+    },
+  },
 ];
 
 const DEFAULT_ALLOWED_ORIGINS = [
@@ -289,6 +380,18 @@ const buildCompactData = (currentData) => ({
     tabunganPlans: currentData?.tabunganPlans || {},
     wallets: currentData?.wallets || {},
   },
+  recurringRules: Array.isArray(currentData?.recurringRules)
+    ? currentData.recurringRules.slice(0, 20).map((rule) => ({
+      id: rule?.id,
+      description: rule?.description,
+      category: rule?.category,
+      amount: rule?.amount,
+      frequency: rule?.frequency,
+      run_time_local: rule?.run_time_local,
+      account_name: rule?.account_name,
+      is_active: rule?.is_active,
+    }))
+    : [],
   recentTransactions: Array.isArray(currentData?.transactions)
     ? currentData.transactions.slice(-20).map((tx) => ({
       id: tx?.id,
@@ -328,7 +431,8 @@ Rules:
 10) If date is missing, still send transaction and let app use local today's date.
 11) You may call multiple tools when needed.
 12) If user asks pure analysis/advice without mutation intent, do not call tools.
-13) Response language: ${targetLanguage}.
+13) For recurring requests (tiap hari/minggu/bulan pada jam tertentu), use recurring tools.
+14) Response language: ${targetLanguage}.
 
 Compact context:
 ${JSON.stringify(compactData)}`;
@@ -618,6 +722,362 @@ const streamOpenRouterText = async (params) => {
   };
 };
 
+const parsePositiveInt = (v, fallback = 1) => {
+  const num = Number(v);
+  if (!Number.isFinite(num) || num <= 0) return fallback;
+  return Math.max(1, Math.round(num));
+};
+
+const toYmd = (date) => date.toISOString().slice(0, 10);
+const parseYmd = (value) => {
+  if (!value) return null;
+  const v = String(value).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return null;
+  return v;
+};
+const clampWeekdays = (arr) =>
+  Array.from(
+    new Set((Array.isArray(arr) ? arr : []).map((n) => Number(n)).filter((n) => Number.isInteger(n) && n >= 1 && n <= 7))
+  ).sort((a, b) => a - b);
+const clampMonthDays = (arr) =>
+  Array.from(
+    new Set((Array.isArray(arr) ? arr : []).map((n) => Number(n)).filter((n) => Number.isInteger(n) && n >= 1 && n <= 31))
+  ).sort((a, b) => a - b);
+const parseTimeHHMM = (value) => {
+  const raw = String(value || "").trim();
+  const match = raw.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return "12:00";
+  const h = Math.min(23, Math.max(0, Number(match[1])));
+  const m = Math.min(59, Math.max(0, Number(match[2])));
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+};
+const getDefaultDateByTimezone = (timeZone) => {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const get = (type) => parts.find((p) => p.type === type)?.value || "01";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+};
+const formatInTimeZoneParts = (date, timeZone) => {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    weekday: "short",
+  });
+  const parts = dtf.formatToParts(date);
+  const read = (type) => parts.find((p) => p.type === type)?.value || "";
+  const weekdayMap = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
+  return {
+    year: Number(read("year")),
+    month: Number(read("month")),
+    day: Number(read("day")),
+    hour: Number(read("hour")),
+    minute: Number(read("minute")),
+    second: Number(read("second")),
+    weekday: weekdayMap[read("weekday")] || 1,
+  };
+};
+const getTimezoneOffsetMinutes = (date, timeZone) => {
+  const parts = formatInTimeZoneParts(date, timeZone);
+  const asUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
+  return Math.round((asUtc - date.getTime()) / 60000);
+};
+const zonedLocalToUtc = (year, month, day, hour, minute, timeZone) => {
+  let guess = Date.UTC(year, month - 1, day, hour, minute, 0);
+  for (let i = 0; i < 3; i += 1) {
+    const offset = getTimezoneOffsetMinutes(new Date(guess), timeZone);
+    guess = Date.UTC(year, month - 1, day, hour, minute, 0) - offset * 60_000;
+  }
+  return new Date(guess);
+};
+const daySerial = (year, month, day) => Math.floor(Date.UTC(year, month - 1, day) / 86_400_000);
+const mondaySerial = (year, month, day, weekday) => daySerial(year, month, day) - (weekday - 1);
+const addDaysYmd = (year, month, day, plus) => {
+  const d = new Date(Date.UTC(year, month - 1, day));
+  d.setUTCDate(d.getUTCDate() + plus);
+  return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() };
+};
+const monthsDiff = (aY, aM, bY, bM) => (aY - bY) * 12 + (aM - bM);
+
+const normalizeRecurringRuleInput = (input, userId, now = new Date()) => {
+  const timeZone = String(input.timezone_name || input.timezoneName || DEFAULT_TIMEZONE).trim() || DEFAULT_TIMEZONE;
+  const frequencyRaw = String(input.frequency || "daily").toLowerCase();
+  const frequency = frequencyRaw === "weekly" ? "weekly" : frequencyRaw === "monthly" ? "monthly" : "daily";
+  const startDate = parseYmd(String(input.start_date || input.startDate || "")) || getDefaultDateByTimezone(timeZone);
+  const endDate = parseYmd(String(input.end_date || input.endDate || ""));
+  const normalized = {
+    user_id: userId,
+    is_active: input.is_active === false ? false : true,
+    tx_type: "expense",
+    amount: Math.max(1, Math.round(Number(input.amount || 0) || 0)),
+    category: String(input.category || "Makan & Minum").trim() || "Makan & Minum",
+    description: String(input.description || input.catatan || "").trim() || "Auto transaksi",
+    method: String(input.method || input.metode || "Auto").trim() || "Auto",
+    account_name: String(input.account_name || input.account || DEFAULT_ACCOUNT_NAME).trim() || DEFAULT_ACCOUNT_NAME,
+    frequency,
+    interval_value: parsePositiveInt(input.interval_value ?? input.interval ?? 1, 1),
+    run_time_local: parseTimeHHMM(input.run_time_local || input.time || "12:00"),
+    weekdays: clampWeekdays(input.weekdays),
+    month_days: clampMonthDays(input.month_days),
+    timezone_mode: String(input.timezone_mode || "device").toLowerCase() === "fixed" ? "fixed" : "device",
+    timezone_name: timeZone,
+    start_date: startDate,
+    end_date: endDate,
+  };
+  if (normalized.amount <= 0) normalized.amount = 25_000;
+  const nextRun = computeNextRunUtc({ ...normalized, id: "", next_run_at_utc: null }, now);
+  return {
+    ...normalized,
+    next_run_at_utc: nextRun ? nextRun.toISOString() : null,
+  };
+};
+
+const computeNextRunUtc = (rule, fromDate) => {
+  const timeZone = rule.timezone_name || DEFAULT_TIMEZONE;
+  const [hh, mm] = (rule.run_time_local || "12:00").split(":").map((v) => Number(v));
+  const nowLocal = formatInTimeZoneParts(fromDate, timeZone);
+  const startYmd = parseYmd(rule.start_date || "") || getDefaultDateByTimezone(timeZone);
+  const [startY, startM, startD] = startYmd.split("-").map(Number);
+  const endYmd = parseYmd(rule.end_date || "");
+  const endParts = endYmd ? endYmd.split("-").map(Number) : null;
+  const endSerial = endParts ? daySerial(endParts[0], endParts[1], endParts[2]) : null;
+  const startLocalSerial = daySerial(startY, startM, startD);
+  const cursorStart = Math.max(startLocalSerial, daySerial(nowLocal.year, nowLocal.month, nowLocal.day) - 1);
+  const anchorLocal = formatInTimeZoneParts(zonedLocalToUtc(startY, startM, startD, 12, 0, timeZone), timeZone);
+  const weeklyAnchorMonday = mondaySerial(startY, startM, startD, anchorLocal.weekday);
+  const maxDaysScan = 370 * 3;
+
+  const matchDay = (y, m, d, weekday) => {
+    const serial = daySerial(y, m, d);
+    if (serial < startLocalSerial) return false;
+    if (endSerial !== null && serial > endSerial) return false;
+    if (rule.frequency === "daily") {
+      const diff = serial - startLocalSerial;
+      return diff % Math.max(1, rule.interval_value || 1) === 0;
+    }
+    if (rule.frequency === "weekly") {
+      const weekdays = rule.weekdays.length ? rule.weekdays : [1];
+      if (!weekdays.includes(weekday)) return false;
+      const weekIndex = Math.floor((serial - weeklyAnchorMonday) / 7);
+      return weekIndex >= 0 && weekIndex % Math.max(1, rule.interval_value || 1) === 0;
+    }
+    const monthDays = rule.month_days.length ? rule.month_days : [startD];
+    if (!monthDays.includes(d)) return false;
+    const mdiff = monthsDiff(y, m, startY, startM);
+    return mdiff >= 0 && mdiff % Math.max(1, rule.interval_value || 1) === 0;
+  };
+
+  for (let offset = 0; offset <= maxDaysScan; offset += 1) {
+    const probe = addDaysYmd(startY, startM, startD, cursorStart - startLocalSerial + offset);
+    const utcProbe = zonedLocalToUtc(probe.year, probe.month, probe.day, hh || 0, mm || 0, timeZone);
+    const local = formatInTimeZoneParts(utcProbe, timeZone);
+    if (!matchDay(local.year, local.month, local.day, local.weekday)) continue;
+    const candidateUtc = zonedLocalToUtc(local.year, local.month, local.day, hh || 0, mm || 0, timeZone);
+    if (candidateUtc.getTime() >= fromDate.getTime() - 1_000) return candidateUtc;
+  }
+  return null;
+};
+
+const syncSnapshotFinance = (accountingData, tx) => {
+  const next = { ...(accountingData || {}) };
+  next.transactions = Array.isArray(next.transactions) ? [...next.transactions, tx] : [tx];
+  next.expenses = isObject(next.expenses) ? { ...next.expenses } : {};
+  next.expenses[tx.category] = Number(next.expenses[tx.category] || 0) + Number(tx.amount || 0);
+  next.wallets = isObject(next.wallets) ? { ...next.wallets } : {};
+  if (!next.wallets[tx.account]) {
+    next.wallets[tx.account] = { type: "Lainnya", startingBalance: 0, currentBalance: 0 };
+  }
+  next.wallets[tx.account] = {
+    ...next.wallets[tx.account],
+    currentBalance: Number(next.wallets[tx.account].currentBalance || 0) - Number(tx.amount || 0),
+  };
+  return next;
+};
+
+const supabaseRestFetch = async (pathWithQuery, init = {}) => {
+  if (!SUPABASE_SERVICE_ROLE_KEY) throw new Error("SUPABASE_SERVICE_ROLE_KEY is missing.");
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${pathWithQuery}`, {
+    ...init,
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      ...(init.headers || {}),
+    },
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Supabase REST ${response.status}: ${text}`);
+  }
+  if (response.status === 204) return null;
+  return response.json();
+};
+
+const insertRecurringRun = async (payload, onConflict = "ignore") => {
+  try {
+    const data = await supabaseRestFetch(`${RECURRING_RUN_TABLE}?on_conflict=rule_id,scheduled_for_utc`, {
+      method: "POST",
+      headers: {
+        Prefer:
+          onConflict === "ignore"
+            ? "resolution=ignore-duplicates,return=representation"
+            : "return=representation",
+      },
+      body: JSON.stringify([payload]),
+    });
+    return Array.isArray(data) ? data[0] : data;
+  } catch (error) {
+    if (onConflict === "ignore" && /duplicate|23505/i.test(String(error?.message || ""))) return null;
+    throw error;
+  }
+};
+
+const updateRecurringRuleRow = async (ruleId, patch) => {
+  const payload = { ...patch, updated_at: new Date().toISOString() };
+  const data = await supabaseRestFetch(`${RECURRING_RULE_TABLE}?id=eq.${encodeURIComponent(ruleId)}&select=*`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify(payload),
+  });
+  return Array.isArray(data) ? data[0] : data;
+};
+
+const buildRecurringTransaction = (rule, scheduledFor) => ({
+  id: `rtx_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+  date: toYmd(scheduledFor),
+  description: rule.description || `Auto ${rule.category}`,
+  amount: Number(rule.amount) || 0,
+  type: rule.tx_type || "expense",
+  category: rule.category || "Lainnya",
+  account: rule.account_name || DEFAULT_ACCOUNT_NAME,
+  note: `[AUTO:${rule.id}] ${rule.description || ""}`.trim(),
+  source: "recurring_rule",
+  method: rule.method || "Auto",
+});
+
+const runRecurringRuleOnce = async (rule, now) => {
+  const scheduledAt = new Date(rule.next_run_at_utc || now.toISOString());
+  const runMarker = await insertRecurringRun(
+    {
+      rule_id: rule.id,
+      user_id: rule.user_id,
+      scheduled_for_utc: scheduledAt.toISOString(),
+      executed_at_utc: now.toISOString(),
+      status: "failed",
+      reason: "processing",
+    },
+    "ignore"
+  );
+  if (!runMarker) return { processed: false, nextRun: null };
+
+  try {
+    const rows = await supabaseRestFetch(
+      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(rule.user_id)}&select=user_id,accounting_data,data_version`
+    );
+    const snapshot = Array.isArray(rows) ? rows[0] : rows;
+    const accountingData = isObject(snapshot?.accounting_data) ? snapshot.accounting_data : {};
+    const walletName = rule.account_name || DEFAULT_ACCOUNT_NAME;
+    const walletBalance = Number(accountingData?.wallets?.[walletName]?.currentBalance || 0);
+    const amount = Number(rule.amount) || 0;
+
+    if (rule.tx_type !== "income" && walletBalance < amount) {
+      await supabaseRestFetch(`${RECURRING_RUN_TABLE}?id=eq.${encodeURIComponent(String(runMarker.id))}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          status: "skipped",
+          reason: "skipped_insufficient_balance",
+          executed_at_utc: new Date().toISOString(),
+          snapshot_version: Number(snapshot?.data_version || 0),
+        }),
+      });
+      const nextRun = computeNextRunUtc(rule, new Date(scheduledAt.getTime() + 60_000));
+      return { processed: true, nextRun };
+    }
+
+    const tx = buildRecurringTransaction(rule, scheduledAt);
+    const synced = syncSnapshotFinance(accountingData, tx);
+    const nextVersion = Date.now();
+    await supabaseRestFetch(`${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(rule.user_id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        accounting_data: synced,
+        data_version: nextVersion,
+        updated_at: new Date().toISOString(),
+      }),
+    });
+    await supabaseRestFetch(`${RECURRING_RUN_TABLE}?id=eq.${encodeURIComponent(String(runMarker.id))}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        status: "success",
+        reason: "executed",
+        transaction_id: String(tx.id),
+        snapshot_version: nextVersion,
+        executed_at_utc: new Date().toISOString(),
+      }),
+    });
+    const nextRun = computeNextRunUtc(rule, new Date(scheduledAt.getTime() + 60_000));
+    return { processed: true, nextRun };
+  } catch (error) {
+    await supabaseRestFetch(`${RECURRING_RUN_TABLE}?id=eq.${encodeURIComponent(String(runMarker.id))}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        status: "failed",
+        reason: String(error?.message || "unknown_error").slice(0, 200),
+        executed_at_utc: new Date().toISOString(),
+      }),
+    });
+    throw error;
+  }
+};
+
+const processRecurringRuleCatchup = async (rule, now) => {
+  let currentRule = { ...rule };
+  let safety = 0;
+  while (
+    currentRule.is_active &&
+    currentRule.next_run_at_utc &&
+    new Date(currentRule.next_run_at_utc).getTime() <= now.getTime() &&
+    safety < 365
+  ) {
+    safety += 1;
+    const { processed, nextRun } = await runRecurringRuleOnce(currentRule, now);
+    if (!processed) break;
+    currentRule.next_run_at_utc = nextRun ? nextRun.toISOString() : null;
+    if (!currentRule.next_run_at_utc) {
+      currentRule.is_active = false;
+      break;
+    }
+  }
+  await updateRecurringRuleRow(currentRule.id, {
+    next_run_at_utc: currentRule.next_run_at_utc,
+    is_active: currentRule.is_active,
+  });
+};
+
+const runRecurringSchedulerTick = async () => {
+  const now = new Date();
+  const dueRules = await supabaseRestFetch(
+    `${RECURRING_RULE_TABLE}?is_active=eq.true&next_run_at_utc=lte.${encodeURIComponent(now.toISOString())}&order=next_run_at_utc.asc&limit=200`
+  );
+  const rows = Array.isArray(dueRules) ? dueRules : [];
+  for (const raw of rows) {
+    try {
+      await processRecurringRuleCatchup(raw, now);
+    } catch (error) {
+      console.error("[recurring] tick rule failed", raw?.id, error);
+    }
+  }
+};
+
 app.use(express.json({ limit: "10mb" }));
 app.use(
   cors({
@@ -652,6 +1112,120 @@ app.get("/api/health/ai", (_req, res) => {
     modelQuickSuggest: OPENROUTER_MODEL_QUICK_SUGGEST,
     nodeEnv: process.env.NODE_ENV || "development",
   });
+});
+
+app.get("/api/recurring-rules", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "").trim();
+    if (!userId) return res.status(400).json({ error: "userId is required." });
+    const rows = await supabaseRestFetch(
+      `${RECURRING_RULE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&order=created_at.desc`
+    );
+    return res.json({ rules: Array.isArray(rows) ? rows : [] });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to list recurring rules." });
+  }
+});
+
+app.post("/api/recurring-rules", async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || "").trim();
+    if (!userId) return res.status(400).json({ error: "userId is required." });
+    const input = normalizeRecurringRuleInput(req.body || {}, userId, new Date());
+    const rows = await supabaseRestFetch(`${RECURRING_RULE_TABLE}?select=*`, {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify([input]),
+    });
+    const row = Array.isArray(rows) ? rows[0] : rows;
+    return res.json({ rule: row });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to create recurring rule." });
+  }
+});
+
+app.patch("/api/recurring-rules/:id", async (req, res) => {
+  try {
+    const ruleId = String(req.params.id || "").trim();
+    const userId = String(req.body?.userId || "").trim();
+    if (!ruleId || !userId) return res.status(400).json({ error: "rule id and userId are required." });
+    const currentRows = await supabaseRestFetch(
+      `${RECURRING_RULE_TABLE}?id=eq.${encodeURIComponent(ruleId)}&user_id=eq.${encodeURIComponent(userId)}&select=*`
+    );
+    const current = Array.isArray(currentRows) ? currentRows[0] : currentRows;
+    if (!current) return res.status(404).json({ error: "Recurring rule not found." });
+
+    const mergedInput = {
+      ...current,
+      ...req.body,
+    };
+    const next = normalizeRecurringRuleInput(mergedInput, userId, new Date());
+    const updated = await updateRecurringRuleRow(ruleId, { ...next, user_id: userId });
+    return res.json({ rule: updated });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to update recurring rule." });
+  }
+});
+
+app.delete("/api/recurring-rules/:id", async (req, res) => {
+  try {
+    const ruleId = String(req.params.id || "").trim();
+    const userId = String(req.query.userId || req.body?.userId || "").trim();
+    if (!ruleId || !userId) return res.status(400).json({ error: "rule id and userId are required." });
+    await supabaseRestFetch(
+      `${RECURRING_RULE_TABLE}?id=eq.${encodeURIComponent(ruleId)}&user_id=eq.${encodeURIComponent(userId)}`,
+      {
+        method: "DELETE",
+        headers: { Prefer: "return=minimal" },
+      }
+    );
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to delete recurring rule." });
+  }
+});
+
+app.get("/api/recurring-runs", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "").trim();
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
+    if (!userId) return res.status(400).json({ error: "userId is required." });
+    const rows = await supabaseRestFetch(
+      `${RECURRING_RUN_TABLE}?user_id=eq.${encodeURIComponent(userId)}&order=created_at.desc&limit=${limit}`
+    );
+    return res.json({ runs: Array.isArray(rows) ? rows : [] });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to list recurring runs." });
+  }
+});
+
+app.post("/api/recurring-rules/:id/sync-timezone", async (req, res) => {
+  try {
+    const ruleId = String(req.params.id || "").trim();
+    const userId = String(req.body?.userId || "").trim();
+    const timezoneName = String(req.body?.timezone_name || "").trim();
+    if (!ruleId || !userId || !timezoneName) {
+      return res.status(400).json({ error: "rule id, userId, and timezone_name are required." });
+    }
+    const currentRows = await supabaseRestFetch(
+      `${RECURRING_RULE_TABLE}?id=eq.${encodeURIComponent(ruleId)}&user_id=eq.${encodeURIComponent(userId)}&select=*`
+    );
+    const current = Array.isArray(currentRows) ? currentRows[0] : currentRows;
+    if (!current) return res.status(404).json({ error: "Recurring rule not found." });
+    const merged = {
+      ...current,
+      timezone_name: timezoneName,
+    };
+    const normalized = normalizeRecurringRuleInput(merged, userId, new Date());
+    const updated = await updateRecurringRuleRow(ruleId, {
+      timezone_name: timezoneName,
+      timezone_mode: "device",
+      next_run_at_utc: normalized.next_run_at_utc,
+    });
+    return res.json({ rule: updated });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to sync timezone." });
+  }
 });
 
 app.post("/api/agent/actions", async (req, res) => {
@@ -1032,6 +1606,20 @@ app.post("/api/report/recommendations", async (req, res) => {
     return res.status(503).json({ error: error?.message || "Report recommendations unavailable" });
   }
 });
+
+if (SUPABASE_SERVICE_ROLE_KEY) {
+  const runTick = async () => {
+    try {
+      await runRecurringSchedulerTick();
+    } catch (error) {
+      console.error("[recurring] scheduler tick failed:", error);
+    }
+  };
+  void runTick();
+  setInterval(runTick, 60_000);
+} else {
+  console.warn("[recurring] scheduler disabled: SUPABASE_SERVICE_ROLE_KEY missing.");
+}
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`BackendOnly running on http://0.0.0.0:${PORT}`);
