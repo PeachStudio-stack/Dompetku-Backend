@@ -78,6 +78,7 @@ pm2 logs Dompetku-BackendOnly --lines 100
 - `POST /api/chat/stream` (SSE, kompatibel dengan frontend sekarang)
 - `POST /api/quick-suggestions`
 - `POST /api/report/recommendations`
+- `POST /api/iap/google/verify`
 
 ## Contoh test dari VPS
 

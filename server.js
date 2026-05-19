@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
+const { JWT } = require("google-auth-library");
 
 const app = express();
 
@@ -35,9 +36,182 @@ const logAiRoute = (route, details = {}) => {
     })
   );
 };
+
+const resolveGoogleServiceAccount = () => {
+  if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+    const parsed = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+    return {
+      clientEmail: parsed.client_email,
+      privateKey: String(parsed.private_key || "").replace(/\\n/g, "\n"),
+    };
+  }
+
+  return {
+    clientEmail: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || "",
+    privateKey: String(process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
+  };
+};
+
+const getGooglePlayAccessToken = async () => {
+  const { clientEmail, privateKey } = resolveGoogleServiceAccount();
+  if (!clientEmail || !privateKey) {
+    throw new Error("Google service account credentials are missing.");
+  }
+
+  const client = new JWT({
+    email: clientEmail,
+    key: privateKey,
+    scopes: ["https://www.googleapis.com/auth/androidpublisher"],
+  });
+  const token = await client.getAccessToken();
+  if (!token.token) throw new Error("Failed to obtain Google Play access token.");
+  return token.token;
+};
+
+const verifyGoogleSubscription = async (purchaseToken) => {
+  if (!GOOGLE_PLAY_PACKAGE_NAME) {
+    throw new Error("GOOGLE_PLAY_PACKAGE_NAME is missing.");
+  }
+
+  const accessToken = await getGooglePlayAccessToken();
+  const response = await fetch(
+    `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(
+      GOOGLE_PLAY_PACKAGE_NAME
+    )}/purchases/subscriptionsv2/tokens/${encodeURIComponent(purchaseToken)}`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    }
+  );
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Google Play verify failed (${response.status}): ${err}`);
+  }
+
+  return response.json();
+};
+
+const verifySupabaseUserAccessToken = async (accessToken) => {
+  if (!accessToken) throw new Error("Missing Supabase access token.");
+
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    headers: {
+      apikey: SUPABASE_PUBLISHABLE_KEY,
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Supabase auth verification failed (${response.status}): ${err}`);
+  }
+
+  return response.json();
+};
+
+const getBearerTokenFromRequest = (req) => {
+  const authHeader = String(req.headers.authorization || "");
+  return authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
+};
+
+const requireSupabaseUser = async (req, res, next) => {
+  try {
+    const accessToken = getBearerTokenFromRequest(req);
+    if (!accessToken) {
+      return res.status(401).json({ error: "Login session tidak ditemukan." });
+    }
+    const authUser = await verifySupabaseUserAccessToken(accessToken);
+    if (!authUser?.id) {
+      return res.status(401).json({ error: "Session Supabase tidak valid." });
+    }
+    req.authUser = {
+      id: String(authUser.id),
+      email: authUser.email || null,
+    };
+    return next();
+  } catch (error) {
+    return res.status(401).json({ error: error?.message || "Session Supabase tidak valid." });
+  }
+};
+
+const persistSubscriptionToSupabase = async (params) => {
+  if (!SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error("SUPABASE_SERVICE_ROLE_KEY is missing.");
+  }
+
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/subscriptions?on_conflict=purchase_token`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "resolution=merge-duplicates,return=representation",
+    },
+    body: JSON.stringify([
+      {
+        user_id: params.userId,
+        plan: params.plan,
+        status: params.status,
+        product_id: params.productId,
+        purchase_token: params.purchaseToken,
+        google_order_id: params.googleOrderId || null,
+        google_subscription_state: params.googleSubscriptionState || null,
+        expires_at: params.expiresAt || null,
+        paid_at: params.paidAt || null,
+        raw_payload: params.rawPayload || null,
+      },
+    ]),
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Supabase subscription upsert failed (${response.status}): ${err}`);
+  }
+
+  const data = await response.json();
+  const saved = Array.isArray(data) ? data[0] : data;
+
+  if (saved?.id && params.status === "active") {
+    await fetch(
+      `${SUPABASE_URL}/rest/v1/subscriptions?user_id=eq.${encodeURIComponent(params.userId)}&status=eq.active&id=neq.${encodeURIComponent(
+        String(saved.id)
+      )}`,
+      {
+        method: "PATCH",
+        headers: {
+          apikey: SUPABASE_SERVICE_ROLE_KEY,
+          Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+          "Content-Type": "application/json",
+          Prefer: "return=minimal",
+        },
+        body: JSON.stringify({ status: "canceled" }),
+      }
+    ).catch((error) => console.warn("Failed to cancel previous active subscriptions:", error));
+  }
+
+  return saved;
+};
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://iygjnjkebhjwvhlmcnng.supabase.co";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const SUPABASE_PUBLISHABLE_KEY =
+  process.env.SUPABASE_PUBLISHABLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  "sb_publishable_EtyubbYluK0jhwk7wSypGw_rDEhRRIn";
+const GOOGLE_PLAY_PACKAGE_NAME = process.env.GOOGLE_PLAY_PACKAGE_NAME || "";
+const PLAN_PRODUCT_MAP = {
+  skeptis: "skeptis_monthly",
+  rajin: "rajin_monthly",
+  freedoom: "freedoom_monthly",
+};
+const PLAN_DB_MAP = {
+  skeptis: "starter",
+  rajin: "personal",
+  freedoom: "family_pro",
+};
 const FINANCE_TABLE = "user_finance_snapshots";
+const ACCESS_OVERRIDE_TABLE = "user_access_overrides";
 const RECURRING_RULE_TABLE = "recurring_transaction_rules";
 const RECURRING_RUN_TABLE = "recurring_transaction_runs";
 const DEFAULT_TIMEZONE = "Asia/Jakarta";
@@ -922,6 +1096,59 @@ const supabaseRestFetch = async (pathWithQuery, init = {}) => {
   return response.json();
 };
 
+const firstRow = (value) => (Array.isArray(value) ? value[0] : value);
+
+const readUserBootstrapData = async (userId) => {
+  const readOrNull = async (label, path) => {
+    try {
+      return firstRow(await supabaseRestFetch(path));
+    } catch (error) {
+      console.warn(`[bootstrap] ${label} unavailable:`, error);
+      return null;
+    }
+  };
+
+  const [profile, referralProgress, subscription, accessOverride] = await Promise.all([
+    readOrNull("profile", `profiles?id=eq.${encodeURIComponent(userId)}&select=display_name,referral_code`),
+    readOrNull(
+      "referral progress",
+      `referral_reward_progress?user_id=eq.${encodeURIComponent(userId)}&select=paid_referrals,tier,inviter_reward,invitee_reward`
+    ),
+    readOrNull(
+      "subscription",
+      `subscriptions?user_id=eq.${encodeURIComponent(
+        userId
+      )}&status=eq.active&select=plan,status,created_at&order=created_at.desc&limit=1`
+    ),
+    readOrNull(
+      "access override",
+      `${ACCESS_OVERRIDE_TABLE}?user_id=eq.${encodeURIComponent(
+        userId
+      )}&select=role,daily_task_limit,input_char_limit,note,updated_at`
+    ),
+  ]);
+
+  return {
+    profile: profile || null,
+    referralProgress: referralProgress || null,
+    subscription: subscription
+      ? {
+          plan: String(subscription.plan || ""),
+          status: String(subscription.status || ""),
+        }
+      : null,
+    accessOverride: accessOverride
+      ? {
+          role: accessOverride.role === "admin" ? "admin" : "user",
+          daily_task_limit: Number(accessOverride.daily_task_limit) || 5,
+          input_char_limit: Number(accessOverride.input_char_limit) || 50,
+          note: accessOverride.note || null,
+          updated_at: accessOverride.updated_at || null,
+        }
+      : null,
+  };
+};
+
 const insertRecurringRun = async (payload, onConflict = "ignore") => {
   try {
     const data = await supabaseRestFetch(`${RECURRING_RUN_TABLE}?on_conflict=rule_id,scheduled_for_utc`, {
@@ -1114,10 +1341,75 @@ app.get("/api/health/ai", (_req, res) => {
   });
 });
 
-app.get("/api/recurring-rules", async (req, res) => {
+app.get("/api/me/bootstrap", requireSupabaseUser, async (req, res) => {
   try {
-    const userId = String(req.query.userId || "").trim();
-    if (!userId) return res.status(400).json({ error: "userId is required." });
+    const userId = req.authUser.id;
+    return res.json(await readUserBootstrapData(userId));
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to load user bootstrap data." });
+  }
+});
+
+app.patch("/api/me/profile", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = req.authUser.id;
+    const displayName = String(req.body?.display_name || "").trim().slice(0, 80);
+    if (!displayName) return res.status(400).json({ error: "display_name wajib diisi." });
+
+    const rows = await supabaseRestFetch("profiles?on_conflict=id&select=display_name,referral_code", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify([{ id: userId, display_name: displayName }]),
+    });
+    return res.json({ profile: firstRow(rows) || null });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to update profile." });
+  }
+});
+
+app.get("/api/accounting-snapshot", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = req.authUser.id;
+    const rows = await supabaseRestFetch(
+      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=accounting_data,data_version,updated_at`
+    );
+    const snapshot = firstRow(rows);
+    return res.json({
+      accountingData: snapshot?.accounting_data || null,
+      dataVersion: snapshot?.data_version || null,
+      updatedAt: snapshot?.updated_at || null,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to read accounting snapshot." });
+  }
+});
+
+app.put("/api/accounting-snapshot", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = req.authUser.id;
+    const accountingData = normalizeAccountingData(req.body?.accountingData || req.body?.accounting_data || {});
+    const dataVersion = Date.now();
+    await supabaseRestFetch(`${FINANCE_TABLE}?on_conflict=user_id`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify([
+        {
+          user_id: userId,
+          accounting_data: accountingData,
+          data_version: dataVersion,
+          updated_at: new Date().toISOString(),
+        },
+      ]),
+    });
+    return res.json({ ok: true, dataVersion });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to save accounting snapshot." });
+  }
+});
+
+app.get("/api/recurring-rules", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = req.authUser.id;
     const rows = await supabaseRestFetch(
       `${RECURRING_RULE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&order=created_at.desc`
     );
@@ -1127,10 +1419,9 @@ app.get("/api/recurring-rules", async (req, res) => {
   }
 });
 
-app.post("/api/recurring-rules", async (req, res) => {
+app.post("/api/recurring-rules", requireSupabaseUser, async (req, res) => {
   try {
-    const userId = String(req.body?.userId || "").trim();
-    if (!userId) return res.status(400).json({ error: "userId is required." });
+    const userId = req.authUser.id;
     const input = normalizeRecurringRuleInput(req.body || {}, userId, new Date());
     const rows = await supabaseRestFetch(`${RECURRING_RULE_TABLE}?select=*`, {
       method: "POST",
@@ -1144,11 +1435,11 @@ app.post("/api/recurring-rules", async (req, res) => {
   }
 });
 
-app.patch("/api/recurring-rules/:id", async (req, res) => {
+app.patch("/api/recurring-rules/:id", requireSupabaseUser, async (req, res) => {
   try {
     const ruleId = String(req.params.id || "").trim();
-    const userId = String(req.body?.userId || "").trim();
-    if (!ruleId || !userId) return res.status(400).json({ error: "rule id and userId are required." });
+    const userId = req.authUser.id;
+    if (!ruleId) return res.status(400).json({ error: "rule id is required." });
     const currentRows = await supabaseRestFetch(
       `${RECURRING_RULE_TABLE}?id=eq.${encodeURIComponent(ruleId)}&user_id=eq.${encodeURIComponent(userId)}&select=*`
     );
@@ -1167,11 +1458,11 @@ app.patch("/api/recurring-rules/:id", async (req, res) => {
   }
 });
 
-app.delete("/api/recurring-rules/:id", async (req, res) => {
+app.delete("/api/recurring-rules/:id", requireSupabaseUser, async (req, res) => {
   try {
     const ruleId = String(req.params.id || "").trim();
-    const userId = String(req.query.userId || req.body?.userId || "").trim();
-    if (!ruleId || !userId) return res.status(400).json({ error: "rule id and userId are required." });
+    const userId = req.authUser.id;
+    if (!ruleId) return res.status(400).json({ error: "rule id is required." });
     await supabaseRestFetch(
       `${RECURRING_RULE_TABLE}?id=eq.${encodeURIComponent(ruleId)}&user_id=eq.${encodeURIComponent(userId)}`,
       {
@@ -1185,11 +1476,10 @@ app.delete("/api/recurring-rules/:id", async (req, res) => {
   }
 });
 
-app.get("/api/recurring-runs", async (req, res) => {
+app.get("/api/recurring-runs", requireSupabaseUser, async (req, res) => {
   try {
-    const userId = String(req.query.userId || "").trim();
+    const userId = req.authUser.id;
     const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
-    if (!userId) return res.status(400).json({ error: "userId is required." });
     const rows = await supabaseRestFetch(
       `${RECURRING_RUN_TABLE}?user_id=eq.${encodeURIComponent(userId)}&order=created_at.desc&limit=${limit}`
     );
@@ -1199,13 +1489,13 @@ app.get("/api/recurring-runs", async (req, res) => {
   }
 });
 
-app.post("/api/recurring-rules/:id/sync-timezone", async (req, res) => {
+app.post("/api/recurring-rules/:id/sync-timezone", requireSupabaseUser, async (req, res) => {
   try {
     const ruleId = String(req.params.id || "").trim();
-    const userId = String(req.body?.userId || "").trim();
+    const userId = req.authUser.id;
     const timezoneName = String(req.body?.timezone_name || "").trim();
-    if (!ruleId || !userId || !timezoneName) {
-      return res.status(400).json({ error: "rule id, userId, and timezone_name are required." });
+    if (!ruleId || !timezoneName) {
+      return res.status(400).json({ error: "rule id and timezone_name are required." });
     }
     const currentRows = await supabaseRestFetch(
       `${RECURRING_RULE_TABLE}?id=eq.${encodeURIComponent(ruleId)}&user_id=eq.${encodeURIComponent(userId)}&select=*`
@@ -1604,6 +1894,112 @@ app.post("/api/report/recommendations", async (req, res) => {
   } catch (error) {
     console.error("Report Recommendation Error:", error);
     return res.status(503).json({ error: error?.message || "Report recommendations unavailable" });
+  }
+});
+
+app.post("/api/iap/google/verify", async (req, res) => {
+  try {
+    const { userId, plan, productId, purchaseToken } = req.body || {};
+    const requestedUserId = String(userId || "").trim();
+    const safePlan = String(plan || "").trim().toLowerCase();
+    const safeProductId = String(productId || "").trim();
+    const safeToken = String(purchaseToken || "").trim();
+    const accessToken = getBearerTokenFromRequest(req);
+
+    if (!safePlan || !safeProductId || !safeToken) {
+      return res.status(400).json({ error: "Missing required fields: plan, productId, purchaseToken." });
+    }
+    if (!SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: "Server subscription writer is not configured." });
+    }
+    if (!accessToken) {
+      return res.status(401).json({ error: "Login session tidak ditemukan untuk verifikasi pembelian." });
+    }
+
+    const expectedProductId = PLAN_PRODUCT_MAP[safePlan];
+    const dbPlan = PLAN_DB_MAP[safePlan];
+    if (!expectedProductId) {
+      return res.status(400).json({ error: `Unknown plan: ${safePlan}` });
+    }
+    if (safeProductId !== expectedProductId) {
+      return res.status(400).json({ error: `Invalid product for plan ${safePlan}` });
+    }
+
+    const authUser = await verifySupabaseUserAccessToken(accessToken);
+    if (!authUser?.id) {
+      return res.status(401).json({ error: "Session Supabase tidak valid." });
+    }
+    if (requestedUserId && requestedUserId !== authUser.id) {
+      return res.status(403).json({ error: "Session user tidak cocok dengan user pembelian." });
+    }
+    const safeUserId = String(authUser.id);
+
+    let verifyPayload = null;
+    let normalizedStatus = "trialing";
+    let paidAt = null;
+    let expiresAt = null;
+    let googleOrderId = null;
+    let googleSubscriptionState = null;
+
+    if (safeToken.startsWith("demo_")) {
+      if (process.env.NODE_ENV === "production") {
+        return res.status(400).json({ error: "Demo purchase token tidak boleh dipakai di production." });
+      }
+      verifyPayload = { mode: "demo", subscriptionState: "SUBSCRIPTION_STATE_ACTIVE" };
+      normalizedStatus = "active";
+      paidAt = new Date().toISOString();
+    } else {
+      verifyPayload = await verifyGoogleSubscription(safeToken);
+      const playState = String(verifyPayload?.subscriptionState || "");
+      googleSubscriptionState = playState || null;
+      googleOrderId = String(verifyPayload?.latestOrderId || verifyPayload?.lineItems?.[0]?.latestSuccessfulOrderId || "") || null;
+      expiresAt = String(verifyPayload?.lineItems?.[0]?.expiryTime || "") || null;
+      if (playState === "SUBSCRIPTION_STATE_ACTIVE") normalizedStatus = "active";
+      if (playState === "SUBSCRIPTION_STATE_IN_GRACE_PERIOD") normalizedStatus = "past_due";
+      if (playState === "SUBSCRIPTION_STATE_ON_HOLD") normalizedStatus = "past_due";
+      if (playState === "SUBSCRIPTION_STATE_CANCELED" || playState === "SUBSCRIPTION_STATE_EXPIRED") {
+        normalizedStatus = "canceled";
+      }
+      if (normalizedStatus === "active") paidAt = new Date().toISOString();
+
+      const actualProductId = verifyPayload?.lineItems?.[0]?.productId;
+      if (actualProductId && actualProductId !== safeProductId) {
+        return res.status(400).json({ error: "Purchase token does not match selected product." });
+      }
+    }
+
+    const savedSubscription = await persistSubscriptionToSupabase({
+      userId: safeUserId,
+      plan: dbPlan || safePlan,
+      status: normalizedStatus,
+      productId: safeProductId,
+      purchaseToken: safeToken,
+      googleOrderId,
+      googleSubscriptionState,
+      expiresAt,
+      paidAt,
+      rawPayload: verifyPayload,
+    });
+
+    return res.json({
+      ok: true,
+      message:
+        normalizedStatus === "active"
+          ? "Pembelian berhasil diverifikasi dan subscription aktif."
+          : "Pembelian terverifikasi, menunggu status aktif dari Google Play.",
+      subscription: {
+        plan: dbPlan || safePlan,
+        productId: safeProductId,
+        status: normalizedStatus,
+        expiresAt,
+        paidAt,
+      },
+      savedSubscription,
+      verifyPayload,
+    });
+  } catch (error) {
+    console.error("IAP verify error:", error);
+    return res.status(500).json({ error: error?.message || "IAP verification failed." });
   }
 });
 
