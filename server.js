@@ -295,6 +295,7 @@ const RATE_LIMIT_QUICK_MAX = Math.max(1, Number(process.env.RATE_LIMIT_QUICK_MAX
 const RATE_LIMIT_IAP_MAX = Math.max(1, Number(process.env.RATE_LIMIT_IAP_MAX || 20));
 const MAX_PROMPT_CHARS = Math.max(200, Number(process.env.MAX_PROMPT_CHARS || 6000));
 const FINANCE_TABLE = "user_finance_snapshots";
+const CATEGORY_TABLE = "user_finance_categories";
 const ACCESS_OVERRIDE_TABLE = "user_access_overrides";
 const RECURRING_RULE_TABLE = "recurring_transaction_rules";
 const RECURRING_RUN_TABLE = "recurring_transaction_runs";
@@ -1187,6 +1188,167 @@ const supabaseRestFetch = async (pathWithQuery, init = {}) => {
 
 const firstRow = (value) => (Array.isArray(value) ? value[0] : value);
 
+const CATEGORY_TYPES = new Set(["income", "expense", "saving", "debt_payment", "asset"]);
+const normalizeCategoryType = (value) => {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw === "income") return "income";
+  if (raw === "expense" || raw === "expenses") return "expense";
+  if (raw === "saving" || raw === "savings") return "saving";
+  if (raw === "debt_payment" || raw === "debt" || raw === "debts") return "debt_payment";
+  if (raw === "asset" || raw === "assets") return "asset";
+  return null;
+};
+const normalizeCategoryName = (value) =>
+  String(value || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[^\p{L}\p{N}\s&\-_]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+const normalizeCategorySlug = (value) =>
+  normalizeCategoryName(value)
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+
+const normalizeAccountingData = (input) => {
+  const source = isObject(input) ? input : {};
+  const categories = isObject(source.categories) ? source.categories : {};
+  const normalized = {
+    ...source,
+    tabunganPlans: isObject(source.tabunganPlans) ? source.tabunganPlans : {},
+    categories: {
+      income: Array.isArray(categories.income) ? categories.income.map((v) => String(v || "").trim()).filter(Boolean) : [],
+      expenses: Array.isArray(categories.expenses) ? categories.expenses.map((v) => String(v || "").trim()).filter(Boolean) : [],
+      assets: Array.isArray(categories.assets) ? categories.assets.map((v) => String(v || "").trim()).filter(Boolean) : [],
+      debts: Array.isArray(categories.debts) ? categories.debts.map((v) => String(v || "").trim()).filter(Boolean) : [],
+      debt_payment: Array.isArray(categories.debt_payment)
+        ? categories.debt_payment.map((v) => String(v || "").trim()).filter(Boolean)
+        : Array.isArray(categories.debts)
+          ? categories.debts.map((v) => String(v || "").trim()).filter(Boolean)
+          : [],
+      saving: Array.isArray(categories.saving) ? categories.saving.map((v) => String(v || "").trim()).filter(Boolean) : [],
+    },
+  };
+  return normalized;
+};
+
+const sortUnique = (values) =>
+  Array.from(new Set((Array.isArray(values) ? values : []).map((v) => String(v || "").trim()).filter(Boolean))).sort((a, b) =>
+    a.localeCompare(b, "id")
+  );
+
+const collectCategorySeedsFromSnapshot = (accountingData) => {
+  const data = normalizeAccountingData(accountingData || {});
+  const seed = new Map();
+  const add = (categoryType, name) => {
+    if (!CATEGORY_TYPES.has(categoryType)) return;
+    const normalizedName = normalizeCategoryName(name);
+    if (!normalizedName) return;
+    const key = `${categoryType}:${normalizeCategorySlug(normalizedName)}`;
+    seed.set(key, { category_type: categoryType, name: normalizedName });
+  };
+
+  for (const name of data.categories.income) add("income", name);
+  for (const name of data.categories.expenses) add("expense", name);
+  for (const name of data.categories.assets) add("asset", name);
+  for (const name of data.categories.debt_payment.length ? data.categories.debt_payment : data.categories.debts)
+    add("debt_payment", name);
+  for (const name of data.categories.saving) add("saving", name);
+  for (const name of Object.keys(data.tabunganPlans || {})) add("saving", name);
+
+  return Array.from(seed.values());
+};
+
+const readUserMasterCategories = async (userId, includeArchived = false) => {
+  const archivedFilter = includeArchived ? "" : "&is_archived=eq.false";
+  const rows = await supabaseRestFetch(
+    `${CATEGORY_TABLE}?user_id=eq.${encodeURIComponent(
+      userId
+    )}${archivedFilter}&select=id,user_id,category_type,name,normalized_name,is_archived,source,created_at,updated_at&order=category_type.asc&order=name.asc`
+  );
+  return Array.isArray(rows) ? rows : [];
+};
+
+const upsertMasterCategories = async (userId, items = []) => {
+  const deduped = new Map();
+  for (const item of items) {
+    const categoryType = normalizeCategoryType(item?.category_type || item?.type || item?.section);
+    const name = normalizeCategoryName(item?.name);
+    if (!categoryType || !name) continue;
+    const normalizedName = normalizeCategorySlug(name);
+    if (!normalizedName) continue;
+    deduped.set(`${categoryType}:${normalizedName}`, {
+      user_id: userId,
+      category_type: categoryType,
+      name,
+      normalized_name: normalizedName,
+      is_archived: false,
+      source: String(item?.source || "manual").trim().toLowerCase() || "manual",
+      updated_at: new Date().toISOString(),
+    });
+  }
+  if (!deduped.size) return [];
+
+  const rows = await supabaseRestFetch(
+    `${CATEGORY_TABLE}?on_conflict=user_id,category_type,normalized_name&select=id,user_id,category_type,name,normalized_name,is_archived,source,created_at,updated_at`,
+    {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify(Array.from(deduped.values())),
+    }
+  );
+  return Array.isArray(rows) ? rows : [];
+};
+
+const buildSnapshotCategoriesFromMaster = (rows, previous) => {
+  const active = (Array.isArray(rows) ? rows : []).filter((item) => !item?.is_archived);
+  const byType = {
+    income: [],
+    expense: [],
+    saving: [],
+    debt_payment: [],
+    asset: [],
+  };
+  for (const row of active) {
+    const categoryType = normalizeCategoryType(row.category_type);
+    if (!categoryType) continue;
+    byType[categoryType].push(row.name);
+  }
+
+  const debtList = sortUnique(byType.debt_payment);
+  const prev = normalizeAccountingData(previous || {}).categories;
+  return {
+    income: sortUnique(byType.income.length ? byType.income : prev.income),
+    expenses: sortUnique(byType.expense.length ? byType.expense : prev.expenses),
+    assets: sortUnique(byType.asset.length ? byType.asset : prev.assets),
+    debts: debtList.length ? debtList : sortUnique(prev.debts),
+    debt_payment: debtList.length ? debtList : sortUnique(prev.debt_payment),
+    saving: sortUnique(byType.saving.length ? byType.saving : prev.saving),
+  };
+};
+
+const ensureCategoryMasterAndMirrorSnapshot = async (userId, rawAccountingData) => {
+  const normalized = normalizeAccountingData(rawAccountingData || {});
+  let rows = await readUserMasterCategories(userId, true);
+
+  if (!rows.length) {
+    const seeds = collectCategorySeedsFromSnapshot(normalized).map((item) => ({
+      ...item,
+      source: "seed",
+    }));
+    await upsertMasterCategories(userId, seeds);
+    rows = await readUserMasterCategories(userId, true);
+  }
+
+  const categories = buildSnapshotCategoriesFromMaster(rows, normalized.categories);
+  const mirrored = normalizeAccountingData({
+    ...normalized,
+    categories,
+  });
+  return { mirrored, rows };
+};
+
 const readUserBootstrapData = async (userId) => {
   const readOrNull = async (label, path) => {
     try {
@@ -1493,8 +1655,21 @@ app.get("/api/accounting-snapshot", requireSupabaseUser, async (req, res) => {
       `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=accounting_data,data_version,updated_at`
     );
     const snapshot = firstRow(rows);
+    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(userId, snapshot?.accounting_data || {});
+    await supabaseRestFetch(`${FINANCE_TABLE}?on_conflict=user_id`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify([
+        {
+          user_id: userId,
+          accounting_data: mirrored,
+          data_version: Number(snapshot?.data_version || Date.now()),
+          updated_at: new Date().toISOString(),
+        },
+      ]),
+    });
     return res.json({
-      accountingData: snapshot?.accounting_data || null,
+      accountingData: mirrored || null,
       dataVersion: snapshot?.data_version || null,
       updatedAt: snapshot?.updated_at || null,
     });
@@ -1507,6 +1682,11 @@ app.put("/api/accounting-snapshot", requireSupabaseUser, async (req, res) => {
   try {
     const userId = req.authUser.id;
     const accountingData = normalizeAccountingData(req.body?.accountingData || req.body?.accounting_data || {});
+    await upsertMasterCategories(
+      userId,
+      collectCategorySeedsFromSnapshot(accountingData).map((item) => ({ ...item, source: "snapshot_sync" }))
+    );
+    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(userId, accountingData);
     const dataVersion = Date.now();
     await supabaseRestFetch(`${FINANCE_TABLE}?on_conflict=user_id`, {
       method: "POST",
@@ -1514,7 +1694,7 @@ app.put("/api/accounting-snapshot", requireSupabaseUser, async (req, res) => {
       body: JSON.stringify([
         {
           user_id: userId,
-          accounting_data: accountingData,
+          accounting_data: mirrored,
           data_version: dataVersion,
           updated_at: new Date().toISOString(),
         },
@@ -1523,6 +1703,202 @@ app.put("/api/accounting-snapshot", requireSupabaseUser, async (req, res) => {
     return res.json({ ok: true, dataVersion });
   } catch (error) {
     return res.status(500).json({ error: error?.message || "Failed to save accounting snapshot." });
+  }
+});
+
+app.get("/api/categories", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = req.authUser.id;
+    const includeArchived = String(req.query.include_archived || "false").toLowerCase() === "true";
+    let categories = await readUserMasterCategories(userId, includeArchived);
+    if (!categories.length) {
+      const snapshotRows = await supabaseRestFetch(
+        `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=accounting_data`
+      );
+      const snapshot = firstRow(snapshotRows);
+      await ensureCategoryMasterAndMirrorSnapshot(userId, snapshot?.accounting_data || {});
+      categories = await readUserMasterCategories(userId, includeArchived);
+    }
+    return res.json({ categories });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to list categories." });
+  }
+});
+
+app.post("/api/categories", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = req.authUser.id;
+    const categoryType = normalizeCategoryType(req.body?.category_type || req.body?.type || req.body?.section);
+    const name = normalizeCategoryName(req.body?.name);
+    if (!categoryType || !name) {
+      return res.status(400).json({ error: "category_type dan name wajib diisi." });
+    }
+
+    const rows = await upsertMasterCategories(userId, [
+      {
+        category_type: categoryType,
+        name,
+        source: req.body?.source || "manual",
+      },
+    ]);
+
+    const snapshotRows = await supabaseRestFetch(
+      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=accounting_data,data_version`
+    );
+    const snapshot = firstRow(snapshotRows);
+    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(userId, snapshot?.accounting_data || {});
+    await supabaseRestFetch(`${FINANCE_TABLE}?on_conflict=user_id`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify([
+        {
+          user_id: userId,
+          accounting_data: mirrored,
+          data_version: Date.now(),
+          updated_at: new Date().toISOString(),
+        },
+      ]),
+    });
+
+    return res.json({ ok: true, category: firstRow(rows) || null });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to create category." });
+  }
+});
+
+app.patch("/api/categories/:id", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = req.authUser.id;
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ error: "Category id wajib diisi." });
+
+    const categoryType = normalizeCategoryType(req.body?.category_type || req.body?.type || req.body?.section);
+    const name = normalizeCategoryName(req.body?.name);
+    if (!categoryType && !name) {
+      return res.status(400).json({ error: "Minimal name atau category_type wajib diisi." });
+    }
+
+    const patch = { updated_at: new Date().toISOString() };
+    if (categoryType) patch.category_type = categoryType;
+    if (name) {
+      patch.name = name;
+      patch.normalized_name = normalizeCategorySlug(name);
+    }
+
+    const rows = await supabaseRestFetch(
+      `${CATEGORY_TABLE}?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}&select=id,user_id,category_type,name,normalized_name,is_archived,source,created_at,updated_at`,
+      {
+        method: "PATCH",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify(patch),
+      }
+    );
+    const category = firstRow(rows);
+    if (!category) return res.status(404).json({ error: "Category tidak ditemukan." });
+
+    const snapshotRows = await supabaseRestFetch(
+      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=accounting_data,data_version`
+    );
+    const snapshot = firstRow(snapshotRows);
+    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(userId, snapshot?.accounting_data || {});
+    await supabaseRestFetch(`${FINANCE_TABLE}?on_conflict=user_id`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify([
+        {
+          user_id: userId,
+          accounting_data: mirrored,
+          data_version: Date.now(),
+          updated_at: new Date().toISOString(),
+        },
+      ]),
+    });
+
+    return res.json({ ok: true, category });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to update category." });
+  }
+});
+
+app.post("/api/categories/:id/archive", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = req.authUser.id;
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ error: "Category id wajib diisi." });
+
+    const rows = await supabaseRestFetch(
+      `${CATEGORY_TABLE}?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}&select=id,user_id,category_type,name,normalized_name,is_archived,source,created_at,updated_at`,
+      {
+        method: "PATCH",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({ is_archived: true, updated_at: new Date().toISOString() }),
+      }
+    );
+    const category = firstRow(rows);
+    if (!category) return res.status(404).json({ error: "Category tidak ditemukan." });
+
+    const snapshotRows = await supabaseRestFetch(
+      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=accounting_data,data_version`
+    );
+    const snapshot = firstRow(snapshotRows);
+    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(userId, snapshot?.accounting_data || {});
+    await supabaseRestFetch(`${FINANCE_TABLE}?on_conflict=user_id`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify([
+        {
+          user_id: userId,
+          accounting_data: mirrored,
+          data_version: Date.now(),
+          updated_at: new Date().toISOString(),
+        },
+      ]),
+    });
+
+    return res.json({ ok: true, category });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to archive category." });
+  }
+});
+
+app.post("/api/categories/:id/unarchive", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = req.authUser.id;
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ error: "Category id wajib diisi." });
+
+    const rows = await supabaseRestFetch(
+      `${CATEGORY_TABLE}?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}&select=id,user_id,category_type,name,normalized_name,is_archived,source,created_at,updated_at`,
+      {
+        method: "PATCH",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({ is_archived: false, updated_at: new Date().toISOString() }),
+      }
+    );
+    const category = firstRow(rows);
+    if (!category) return res.status(404).json({ error: "Category tidak ditemukan." });
+
+    const snapshotRows = await supabaseRestFetch(
+      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=accounting_data,data_version`
+    );
+    const snapshot = firstRow(snapshotRows);
+    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(userId, snapshot?.accounting_data || {});
+    await supabaseRestFetch(`${FINANCE_TABLE}?on_conflict=user_id`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify([
+        {
+          user_id: userId,
+          accounting_data: mirrored,
+          data_version: Date.now(),
+          updated_at: new Date().toISOString(),
+        },
+      ]),
+    });
+
+    return res.json({ ok: true, category });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to unarchive category." });
   }
 });
 
