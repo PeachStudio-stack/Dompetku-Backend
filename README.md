@@ -32,6 +32,7 @@ Wajib isi:
 - `OPENROUTER_MODEL_FREE=deepseek/deepseek-v4-flash:free`
 - `OPENROUTER_MODEL_REPORT_RECOMMENDATION=deepseek/deepseek-v4-flash:free`
 - `CORS_ALLOWED_ORIGINS` (domain frontend kamu + origin Capacitor: `http://localhost`, `https://localhost`, `capacitor://localhost`)
+- `ENABLE_ADMIN_IAP_BYPASS=false` (default, aktifkan hanya untuk debug non-production)
 
 Contoh:
 
@@ -43,6 +44,8 @@ OPENROUTER_MODEL_FREE=deepseek/deepseek-v4-flash:free
 OPENROUTER_MODEL_REPORT_RECOMMENDATION=deepseek/deepseek-v4-flash:free
 OPENROUTER_MODEL_QUICK_SUGGEST=deepseek/deepseek-v4-flash:free
 CORS_ALLOWED_ORIGINS=http://localhost,https://localhost,http://localhost:3000,https://localhost:3000,capacitor://localhost,https://app.domainkamu.com
+ENABLE_ADMIN_IAP_BYPASS=false
+TRUST_PROXY=loopback
 ```
 
 ## 4) Jalankan dengan PM2
@@ -79,6 +82,7 @@ pm2 logs Dompetku-BackendOnly --lines 100
 - `POST /api/quick-suggestions`
 - `POST /api/report/recommendations`
 - `POST /api/iap/google/verify`
+- `POST /api/iap/admin/activate` (debug only, admin only, non-production)
 
 ## Contoh test dari VPS
 
@@ -97,3 +101,4 @@ curl -sS -X POST http://127.0.0.1:3000/api/chat \
 - Jangan expose `OPENROUTER_API_KEY` di frontend / APK.
 - Jika key pernah bocor, segera revoke/rotate key di OpenRouter.
 - Batasi `CORS_ALLOWED_ORIGINS` hanya domain/app yang kamu pakai.
+- Jangan aktifkan `ENABLE_ADMIN_IAP_BYPASS=true` di production.

@@ -2,6 +2,8 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
+const { rateLimit } = require("express-rate-limit");
 const { JWT } = require("google-auth-library");
 
 const app = express();
@@ -136,6 +138,49 @@ const requireSupabaseUser = async (req, res, next) => {
   }
 };
 
+const readAccessOverrideByUserId = async (userId) => {
+  const rows = await supabaseRestFetch(
+    `${ACCESS_OVERRIDE_TABLE}?user_id=eq.${encodeURIComponent(
+      userId
+    )}&select=role,daily_task_limit,input_char_limit,note,updated_at&limit=1`
+  );
+  const row = firstRow(rows);
+  if (!row) return null;
+  return {
+    role: row.role === "admin" ? "admin" : "user",
+    daily_task_limit: Number(row.daily_task_limit) || 5,
+    input_char_limit: Number(row.input_char_limit) || 50,
+    note: row.note || null,
+    updated_at: row.updated_at || null,
+  };
+};
+
+const ensurePromptPayload = (payload) => {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("Payload request tidak valid.");
+  }
+  const prompt = String(payload.prompt || "").trim();
+  if (!prompt) {
+    throw new Error("Prompt tidak boleh kosong.");
+  }
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    throw new Error(`Prompt terlalu panjang. Maksimal ${MAX_PROMPT_CHARS} karakter.`);
+  }
+  return prompt;
+};
+
+const logSecurityEvent = (event, payload = {}) => {
+  console.log(
+    "[security]",
+    JSON.stringify({
+      event,
+      nodeEnv: NODE_ENV,
+      ts: new Date().toISOString(),
+      ...payload,
+    })
+  );
+};
+
 const persistSubscriptionToSupabase = async (params) => {
   if (!SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error("SUPABASE_SERVICE_ROLE_KEY is missing.");
@@ -231,6 +276,24 @@ const PLAN_DB_MAP = {
   rajin: "personal",
   freedoom: "family_pro",
 };
+const NODE_ENV = String(process.env.NODE_ENV || "development").toLowerCase();
+const IS_PRODUCTION = NODE_ENV === "production";
+const ENABLE_ADMIN_IAP_BYPASS =
+  String(process.env.ENABLE_ADMIN_IAP_BYPASS || "false").toLowerCase() === "true";
+const TRUST_PROXY_RAW = String(process.env.TRUST_PROXY || "loopback").trim();
+const TRUST_PROXY =
+  TRUST_PROXY_RAW === "true"
+    ? true
+    : TRUST_PROXY_RAW === "false"
+      ? false
+      : Number.isFinite(Number(TRUST_PROXY_RAW)) && TRUST_PROXY_RAW !== ""
+        ? Number(TRUST_PROXY_RAW)
+        : TRUST_PROXY_RAW;
+const RATE_LIMIT_WINDOW_MS = Math.max(10_000, Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000));
+const RATE_LIMIT_CHAT_MAX = Math.max(1, Number(process.env.RATE_LIMIT_CHAT_MAX || 50));
+const RATE_LIMIT_QUICK_MAX = Math.max(1, Number(process.env.RATE_LIMIT_QUICK_MAX || 40));
+const RATE_LIMIT_IAP_MAX = Math.max(1, Number(process.env.RATE_LIMIT_IAP_MAX || 20));
+const MAX_PROMPT_CHARS = Math.max(200, Number(process.env.MAX_PROMPT_CHARS || 6000));
 const FINANCE_TABLE = "user_finance_snapshots";
 const ACCESS_OVERRIDE_TABLE = "user_access_overrides";
 const RECURRING_RULE_TABLE = "recurring_transaction_rules";
@@ -475,16 +538,21 @@ const DEFAULT_ALLOWED_ORIGINS = [
   "capacitor://localhost",
   "ionic://localhost",
 ];
+const ENV_ALLOWED_ORIGINS = String(process.env.CORS_ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((v) => v.trim())
+  .filter(Boolean)
+  .filter((v) => !v.includes("*"));
 const ALLOWED_ORIGINS = Array.from(
   new Set([
     ...DEFAULT_ALLOWED_ORIGINS,
-    ...String(process.env.CORS_ALLOWED_ORIGINS || "")
-      .split(",")
-      .map((v) => v.trim())
-      .filter(Boolean),
+    ...ENV_ALLOWED_ORIGINS,
   ])
 );
 const LOCALHOST_ORIGIN_PROTOCOLS = new Set(["http:", "https:", "capacitor:", "ionic:"]);
+if (String(process.env.CORS_ALLOWED_ORIGINS || "").includes("*")) {
+  console.warn("[security] wildcard origin diabaikan dari CORS_ALLOWED_ORIGINS.");
+}
 
 const isAllowedOrigin = (origin) => {
   if (!origin) return true;
@@ -1326,6 +1394,8 @@ const runRecurringSchedulerTick = async () => {
   }
 };
 
+app.set("trust proxy", TRUST_PROXY);
+app.use(helmet());
 app.use(express.json({ limit: "10mb" }));
 app.use(
   cors({
@@ -1336,11 +1406,39 @@ app.use(
   })
 );
 
+const makeLimiter = (max, scope) =>
+  rateLimit({
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    max,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    message: { error: "Terlalu banyak request. Coba lagi sebentar." },
+    handler: (req, res) => {
+      logSecurityEvent("rate_limit_block", {
+        scope,
+        ip: req.ip,
+        path: req.path,
+      });
+      return res.status(429).json({ error: "Terlalu banyak request. Coba lagi sebentar." });
+    },
+  });
+
+app.use("/api/chat", makeLimiter(RATE_LIMIT_CHAT_MAX, "chat"));
+app.use("/api/chat/stream", makeLimiter(RATE_LIMIT_CHAT_MAX, "chat_stream"));
+app.use("/api/quick-suggestions", makeLimiter(RATE_LIMIT_QUICK_MAX, "quick_suggestions"));
+app.use("/api/iap", makeLimiter(RATE_LIMIT_IAP_MAX, "iap"));
+
 app.get("/health", (_req, res) => {
-  res.json({
+  const base = {
     ok: true,
     app: "Dompetku-BackendOnly",
-    env: process.env.NODE_ENV || "development",
+    env: NODE_ENV,
+  };
+  if (IS_PRODUCTION) {
+    return res.json(base);
+  }
+  return res.json({
+    ...base,
     openrouterKeyLoaded: hasOpenRouterKey(),
     models: {
       fast: OPENROUTER_MODEL_FAST,
@@ -1541,13 +1639,15 @@ app.post("/api/recurring-rules/:id/sync-timezone", requireSupabaseUser, async (r
 
 app.post("/api/agent/actions", async (req, res) => {
   const started = Date.now();
+  let safePrompt = "";
   try {
-    const { prompt, currentData, language, accessPlan } = req.body || {};
-    const safePrompt = String(prompt || "").trim();
-    if (!safePrompt) {
+    const { currentData, language, accessPlan } = req.body || {};
+    try {
+      safePrompt = ensurePromptPayload(req.body || {});
+    } catch (error) {
       return res.status(400).json({
         ok: false,
-        error: "Prompt tidak boleh kosong.",
+        error: error?.message || "Payload tidak valid.",
         actions: [],
         assistantText: "",
       });
@@ -1644,8 +1744,14 @@ app.post("/api/agent/actions", async (req, res) => {
 
 app.post("/api/chat", async (req, res) => {
   const started = Date.now();
+  let prompt = "";
   try {
-    const { prompt, currentData, language, accessPlan } = req.body || {};
+    const { currentData, language, accessPlan } = req.body || {};
+    try {
+      prompt = ensurePromptPayload(req.body || {});
+    } catch (error) {
+      return res.status(400).json({ error: error?.message || "Payload tidak valid." });
+    }
     const targetLanguage = language || "Indonesian";
     const { primary, secondary, primaryTimeout, secondaryTimeout, maxTokens } =
       resolveAccessModelPlan(prompt || "", accessPlan);
@@ -1731,8 +1837,15 @@ app.post("/api/chat/stream", async (req, res) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
 
+  let prompt = "";
   try {
-    const { prompt, currentData, language, accessPlan } = req.body || {};
+    const { currentData, language, accessPlan } = req.body || {};
+    try {
+      prompt = ensurePromptPayload(req.body || {});
+    } catch (error) {
+      res.status(400).json({ error: error?.message || "Payload tidak valid." });
+      return;
+    }
     const targetLanguage = language || "Indonesian";
     const { primary, secondary, primaryTimeout, secondaryTimeout, maxTokens } =
       resolveAccessModelPlan(prompt || "", accessPlan);
@@ -1826,6 +1939,9 @@ app.post("/api/quick-suggestions", async (req, res) => {
     const { text, language, accessPlan } = req.body || {};
     const query = String(text || "").trim();
     if (!query) return res.json({ suggestions: [] });
+    if (query.length > MAX_PROMPT_CHARS) {
+      return res.status(400).json({ error: `Input terlalu panjang. Maksimal ${MAX_PROMPT_CHARS} karakter.` });
+    }
 
     const prompt = `User is typing this request: "${query}".
 Generate exactly 3 short quick suggestions for a personal finance assistant app.
@@ -1915,6 +2031,102 @@ app.post("/api/report/recommendations", async (req, res) => {
   } catch (error) {
     console.error("Report Recommendation Error:", error);
     return res.status(503).json({ error: error?.message || "Report recommendations unavailable" });
+  }
+});
+
+app.post("/api/iap/admin/activate", requireSupabaseUser, async (req, res) => {
+  try {
+    if (!ENABLE_ADMIN_IAP_BYPASS || IS_PRODUCTION) {
+      return res.status(403).json({ error: "Akses endpoint tidak tersedia." });
+    }
+    if (!SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: "Server subscription writer is not configured." });
+    }
+
+    const actorUserId = String(req.authUser?.id || "").trim();
+    const { userId, plan, productId } = req.body || {};
+    const requestedUserId = String(userId || "").trim();
+    const safePlan = String(plan || "").trim().toLowerCase();
+    const safeProductId = String(productId || "").trim();
+
+    if (!safePlan || !safeProductId) {
+      return res.status(400).json({ error: "Missing required fields: plan, productId." });
+    }
+
+    const expectedProductId = PLAN_PRODUCT_MAP[safePlan];
+    const dbPlan = PLAN_DB_MAP[safePlan];
+    if (!expectedProductId) {
+      return res.status(400).json({ error: `Unknown plan: ${safePlan}` });
+    }
+    if (safeProductId !== expectedProductId) {
+      return res.status(400).json({ error: `Invalid product for plan ${safePlan}` });
+    }
+
+    const override = await readAccessOverrideByUserId(actorUserId);
+    if (!override || override.role !== "admin") {
+      logSecurityEvent("admin_iap_bypass_denied_non_admin", {
+        actor_user_id: actorUserId,
+        requested_user_id: requestedUserId || actorUserId,
+      });
+      return res.status(403).json({ error: "Akses ditolak." });
+    }
+
+    if (requestedUserId && requestedUserId !== actorUserId) {
+      logSecurityEvent("admin_iap_bypass_denied_user_mismatch", {
+        actor_user_id: actorUserId,
+        requested_user_id: requestedUserId,
+      });
+      return res.status(403).json({ error: "Target user tidak valid." });
+    }
+
+    const targetUserId = requestedUserId || actorUserId;
+    const nowIso = new Date().toISOString();
+    const purchaseToken = `admin_debug_${targetUserId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    const savedSubscription = await persistSubscriptionToSupabase({
+      userId: targetUserId,
+      plan: dbPlan || safePlan,
+      status: "active",
+      productId: safeProductId,
+      purchaseToken,
+      paidAt: nowIso,
+      expiresAt: null,
+      rawPayload: {
+        source: "admin_debug_bypass",
+        mode: "admin_debug_bypass",
+        actor_user_id: actorUserId,
+        target_user_id: targetUserId,
+        plan: dbPlan || safePlan,
+        product_id: safeProductId,
+        activated_at: nowIso,
+      },
+    });
+
+    logSecurityEvent("admin_iap_bypass_activated", {
+      actor_user_id: actorUserId,
+      target_user_id: targetUserId,
+      plan: dbPlan || safePlan,
+      product_id: safeProductId,
+      created_subscription_id: savedSubscription?.id || null,
+      mode: "admin_debug_bypass",
+    });
+
+    return res.json({
+      ok: true,
+      mode: "admin_debug_bypass",
+      message: "Bypass debug admin berhasil. Subscription aktif.",
+      subscription: {
+        plan: dbPlan || safePlan,
+        productId: safeProductId,
+        status: "active",
+        expiresAt: null,
+        paidAt: nowIso,
+      },
+      savedSubscription,
+    });
+  } catch (error) {
+    console.error("Admin IAP bypass error:", error);
+    return res.status(500).json({ error: error?.message || "Admin debug bypass failed." });
   }
 });
 
