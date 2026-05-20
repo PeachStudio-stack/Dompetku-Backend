@@ -155,6 +155,16 @@ const readAccessOverrideByUserId = async (userId) => {
   };
 };
 
+const mapPromoError = (message) => {
+  if (message.includes("PROMO_NOT_FOUND")) return "PROMO_NOT_FOUND";
+  if (message.includes("PROMO_INACTIVE")) return "PROMO_INACTIVE";
+  if (message.includes("PROMO_EXPIRED")) return "PROMO_EXPIRED";
+  if (message.includes("PROMO_QUOTA_EXCEEDED")) return "PROMO_QUOTA_EXCEEDED";
+  if (message.includes("PROMO_ALREADY_REDEEMED")) return "PROMO_ALREADY_REDEEMED";
+  if (message.includes("PROMO_INVALID_REWARD")) return "PROMO_INVALID_REWARD";
+  return "PROMO_REDEEM_FAILED";
+};
+
 const ensurePromptPayload = (payload) => {
   if (!payload || typeof payload !== "object") {
     throw new Error("Payload request tidak valid.");
@@ -278,8 +288,6 @@ const PLAN_DB_MAP = {
 };
 const NODE_ENV = String(process.env.NODE_ENV || "development").toLowerCase();
 const IS_PRODUCTION = NODE_ENV === "production";
-const ENABLE_ADMIN_IAP_BYPASS =
-  String(process.env.ENABLE_ADMIN_IAP_BYPASS || "false").toLowerCase() === "true";
 const TRUST_PROXY_RAW = String(process.env.TRUST_PROXY || "loopback").trim();
 const TRUST_PROXY =
   TRUST_PROXY_RAW === "true"
@@ -297,6 +305,7 @@ const MAX_PROMPT_CHARS = Math.max(200, Number(process.env.MAX_PROMPT_CHARS || 60
 const FINANCE_TABLE = "user_finance_snapshots";
 const CATEGORY_TABLE = "user_finance_categories";
 const ACCESS_OVERRIDE_TABLE = "user_access_overrides";
+const PROMO_CODE_TABLE = "promo.codes";
 const RECURRING_RULE_TABLE = "recurring_transaction_rules";
 const RECURRING_RUN_TABLE = "recurring_transaction_runs";
 const DEFAULT_TIMEZONE = "Asia/Jakarta";
@@ -1359,12 +1368,8 @@ const readUserBootstrapData = async (userId) => {
     }
   };
 
-  const [profile, referralProgress, subscription, accessOverride] = await Promise.all([
+  const [profile, subscription, accessOverride] = await Promise.all([
     readOrNull("profile", `profiles?id=eq.${encodeURIComponent(userId)}&select=display_name,referral_code`),
-    readOrNull(
-      "referral progress",
-      `referral_reward_progress?user_id=eq.${encodeURIComponent(userId)}&select=paid_referrals,tier,inviter_reward,invitee_reward`
-    ),
     readOrNull(
       "subscription",
       `subscriptions?user_id=eq.${encodeURIComponent(
@@ -1381,7 +1386,6 @@ const readUserBootstrapData = async (userId) => {
 
   return {
     profile: profile || null,
-    referralProgress: referralProgress || null,
     subscription: subscription
       ? {
           plan: String(subscription.plan || ""),
@@ -2410,99 +2414,84 @@ app.post("/api/report/recommendations", async (req, res) => {
   }
 });
 
-app.post("/api/iap/admin/activate", requireSupabaseUser, async (req, res) => {
+app.get("/api/promocodes/public", async (req, res) => {
   try {
-    if (!ENABLE_ADMIN_IAP_BYPASS || IS_PRODUCTION) {
-      return res.status(403).json({ error: "Akses endpoint tidak tersedia." });
-    }
+    const code = String(req.query.code || "").trim().toUpperCase();
     if (!SUPABASE_SERVICE_ROLE_KEY) {
-      return res.status(503).json({ error: "Server subscription writer is not configured." });
+      return res.status(503).json({ error: "PromoCode service belum dikonfigurasi di server." });
     }
-
-    const actorUserId = String(req.authUser?.id || "").trim();
-    const { userId, plan, productId } = req.body || {};
-    const requestedUserId = String(userId || "").trim();
-    const safePlan = String(plan || "").trim().toLowerCase();
-    const safeProductId = String(productId || "").trim();
-
-    if (!safePlan || !safeProductId) {
-      return res.status(400).json({ error: "Missing required fields: plan, productId." });
-    }
-
-    const expectedProductId = PLAN_PRODUCT_MAP[safePlan];
-    const dbPlan = PLAN_DB_MAP[safePlan];
-    if (!expectedProductId) {
-      return res.status(400).json({ error: `Unknown plan: ${safePlan}` });
-    }
-    if (safeProductId !== expectedProductId) {
-      return res.status(400).json({ error: `Invalid product for plan ${safePlan}` });
-    }
-
-    const override = await readAccessOverrideByUserId(actorUserId);
-    if (!override || override.role !== "admin") {
-      logSecurityEvent("admin_iap_bypass_denied_non_admin", {
-        actor_user_id: actorUserId,
-        requested_user_id: requestedUserId || actorUserId,
-      });
-      return res.status(403).json({ error: "Akses ditolak." });
-    }
-
-    if (requestedUserId && requestedUserId !== actorUserId) {
-      logSecurityEvent("admin_iap_bypass_denied_user_mismatch", {
-        actor_user_id: actorUserId,
-        requested_user_id: requestedUserId,
-      });
-      return res.status(403).json({ error: "Target user tidak valid." });
-    }
-
-    const targetUserId = requestedUserId || actorUserId;
+    const codeFilter = code ? `&code=eq.${encodeURIComponent(code)}` : "";
+    const rows = await supabaseRestFetch(
+      `${PROMO_CODE_TABLE}?is_active=eq.true${codeFilter}&select=code,reward_type,plan_code,duration_days,daily_task_limit,input_char_limit,note,starts_at,expires_at,quota_total,quota_used&order=code.asc`
+    );
     const nowIso = new Date().toISOString();
-    const purchaseToken = `admin_debug_${targetUserId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const items = (Array.isArray(rows) ? rows : []).map((row) => ({
+      code: String(row.code || "").toUpperCase(),
+      reward_type: String(row.reward_type || "plan"),
+      plan_code: String(row.plan_code || "") || null,
+      duration_days: Number(row.duration_days || 0) || 0,
+      daily_task_limit: Number(row.daily_task_limit || 0) || 0,
+      input_char_limit: Number(row.input_char_limit || 0) || 0,
+      starts_at: row.starts_at || null,
+      expires_at: row.expires_at || null,
+      quota_total: Number(row.quota_total || 0) || 0,
+      quota_used: Number(row.quota_used || 0) || 0,
+      is_redeemable:
+        (!row.starts_at || String(row.starts_at) <= nowIso) &&
+        (!row.expires_at || String(row.expires_at) >= nowIso) &&
+        (Number(row.quota_total || 0) <= 0 || Number(row.quota_used || 0) < Number(row.quota_total || 0)),
+      note: row.note || null,
+    }));
+    return res.json({ rewards: items });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to read promocodes." });
+  }
+});
 
-    const savedSubscription = await persistSubscriptionToSupabase({
-      userId: targetUserId,
-      plan: dbPlan || safePlan,
-      status: "active",
-      productId: safeProductId,
-      purchaseToken,
-      paidAt: nowIso,
-      expiresAt: null,
-      rawPayload: {
-        source: "admin_debug_bypass",
-        mode: "admin_debug_bypass",
-        actor_user_id: actorUserId,
-        target_user_id: targetUserId,
-        plan: dbPlan || safePlan,
-        product_id: safeProductId,
-        activated_at: nowIso,
-      },
+app.post("/api/promocodes/redeem", requireSupabaseUser, async (req, res) => {
+  try {
+    if (!SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: "PromoCode service belum dikonfigurasi di server." });
+    }
+    const userId = req.authUser?.id;
+    const code = String(req.body?.code || "").trim().toUpperCase();
+    if (!code) return res.status(400).json({ error: "Kode PromoCode wajib diisi.", errorCode: "PROMO_NOT_FOUND" });
+
+    const result = await supabaseRestFetch("rpc/redeem_promocode", {
+      method: "POST",
+      body: JSON.stringify({ p_user_id: userId, p_code: code }),
     });
-
-    logSecurityEvent("admin_iap_bypass_activated", {
-      actor_user_id: actorUserId,
-      target_user_id: targetUserId,
-      plan: dbPlan || safePlan,
-      product_id: safeProductId,
-      created_subscription_id: savedSubscription?.id || null,
-      mode: "admin_debug_bypass",
-    });
-
+    const payload = firstRow(result) || result;
     return res.json({
       ok: true,
-      mode: "admin_debug_bypass",
-      message: "Bypass debug admin berhasil. Subscription aktif.",
-      subscription: {
-        plan: dbPlan || safePlan,
-        productId: safeProductId,
-        status: "active",
-        expiresAt: null,
-        paidAt: nowIso,
-      },
-      savedSubscription,
+      alreadyRedeemed: Boolean(payload?.already_redeemed),
+      code,
+      appliedReward: payload?.applied_reward || null,
+      subscription: payload?.subscription || null,
+      accessOverride: payload?.access_override || null,
+      message: String(payload?.message || "PromoCode berhasil diterapkan."),
     });
   } catch (error) {
-    console.error("Admin IAP bypass error:", error);
-    return res.status(500).json({ error: error?.message || "Admin debug bypass failed." });
+    const message = String(error?.message || "");
+    const errorCode = mapPromoError(message);
+    if (errorCode === "PROMO_ALREADY_REDEEMED") {
+      return res.json({
+        ok: true,
+        alreadyRedeemed: true,
+        code: String(req.body?.code || "").trim().toUpperCase(),
+        appliedReward: null,
+        subscription: null,
+        accessOverride: null,
+        message: "PromoCode sudah pernah dipakai di akun ini.",
+        errorCode,
+      });
+    }
+    const status = errorCode === "PROMO_NOT_FOUND" ? 404 : 400;
+    return res.status(status).json({
+      ok: false,
+      error: message || "Failed to redeem promocode.",
+      errorCode,
+    });
   }
 });
 
