@@ -29,8 +29,8 @@ nano .env
 Wajib isi:
 
 - `OPENROUTER_API_KEY` (valid)
-- `OPENROUTER_MODEL_FREE=openrouter/free`
-- `OPENROUTER_MODEL_REPORT_RECOMMENDATION=openrouter/free`
+- `OPENROUTER_MODEL_FREE=deepseek/deepseek-v4-flash:free`
+- `OPENROUTER_MODEL_REPORT_RECOMMENDATION=deepseek/deepseek-v4-flash:free`
 - `CORS_ALLOWED_ORIGINS` (domain frontend kamu + origin Capacitor: `http://localhost`, `https://localhost`, `capacitor://localhost`)
 
 Contoh:
@@ -39,9 +39,9 @@ Contoh:
 NODE_ENV=production
 PORT=3000
 OPENROUTER_API_KEY=sk-or-v1-xxxx
-OPENROUTER_MODEL_FREE=openrouter/free
-OPENROUTER_MODEL_REPORT_RECOMMENDATION=openrouter/free
-OPENROUTER_MODEL_QUICK_SUGGEST=openrouter/free
+OPENROUTER_MODEL_FREE=deepseek/deepseek-v4-flash:free
+OPENROUTER_MODEL_REPORT_RECOMMENDATION=deepseek/deepseek-v4-flash:free
+OPENROUTER_MODEL_QUICK_SUGGEST=deepseek/deepseek-v4-flash:free
 CORS_ALLOWED_ORIGINS=http://localhost,https://localhost,http://localhost:3000,https://localhost:3000,capacitor://localhost,https://app.domainkamu.com
 ```
 

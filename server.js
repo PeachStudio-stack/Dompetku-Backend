@@ -9,13 +9,13 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const OPENROUTER_URL = process.env.OPENROUTER_URL || "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
-const OPENROUTER_MODEL_FAST = process.env.OPENROUTER_MODEL_FAST || "deepseek/deepseek-chat";
-const OPENROUTER_MODEL_HEAVY = process.env.OPENROUTER_MODEL_HEAVY || "deepseek/deepseek-v4-flash:exacto";
+const OPENROUTER_MODEL_FAST = process.env.OPENROUTER_MODEL_FAST || "deepseek/deepseek-v4-flash";
+const OPENROUTER_MODEL_HEAVY = process.env.OPENROUTER_MODEL_HEAVY || "deepseek/deepseek-v4-flash";
 const OPENROUTER_MODEL_QUICK_SUGGEST =
-  process.env.OPENROUTER_MODEL_QUICK_SUGGEST || "openrouter/free";
-const OPENROUTER_MODEL_FREE = process.env.OPENROUTER_MODEL_FREE || "openrouter/free";
+  process.env.OPENROUTER_MODEL_QUICK_SUGGEST || "deepseek/deepseek-v4-flash:free";
+const OPENROUTER_MODEL_FREE = process.env.OPENROUTER_MODEL_FREE || "deepseek/deepseek-v4-flash:free";
 const OPENROUTER_MODEL_REPORT_RECOMMENDATION =
-  process.env.OPENROUTER_MODEL_REPORT_RECOMMENDATION || "openrouter/free";
+  process.env.OPENROUTER_MODEL_REPORT_RECOMMENDATION || "deepseek/deepseek-v4-flash:free";
 const OPENROUTER_TIMEOUT_FAST_MS = Number(process.env.OPENROUTER_TIMEOUT_FAST_MS || 12000);
 const OPENROUTER_TIMEOUT_HEAVY_MS = Number(process.env.OPENROUTER_TIMEOUT_HEAVY_MS || 25000);
 const hasOpenRouterKey = () => Boolean(OPENROUTER_API_KEY.trim());
@@ -141,33 +141,54 @@ const persistSubscriptionToSupabase = async (params) => {
     throw new Error("SUPABASE_SERVICE_ROLE_KEY is missing.");
   }
 
-  const response = await fetch(`${SUPABASE_URL}/rest/v1/subscriptions?on_conflict=purchase_token`, {
-    method: "POST",
-    headers: {
-      apikey: SUPABASE_SERVICE_ROLE_KEY,
-      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-      "Content-Type": "application/json",
-      Prefer: "resolution=merge-duplicates,return=representation",
-    },
-    body: JSON.stringify([
-      {
-        user_id: params.userId,
-        plan: params.plan,
-        status: params.status,
-        product_id: params.productId,
-        purchase_token: params.purchaseToken,
-        google_order_id: params.googleOrderId || null,
-        google_subscription_state: params.googleSubscriptionState || null,
-        expires_at: params.expiresAt || null,
-        paid_at: params.paidAt || null,
-        raw_payload: params.rawPayload || null,
+  const postSubscription = (pathWithQuery, payload, prefer) =>
+    fetch(`${SUPABASE_URL}/rest/v1/${pathWithQuery}`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: prefer,
       },
-    ]),
-  });
+      body: JSON.stringify([payload]),
+    });
+
+  const fullPayload = {
+    user_id: params.userId,
+    plan: params.plan,
+    status: params.status,
+    product_id: params.productId,
+    purchase_token: params.purchaseToken,
+    google_order_id: params.googleOrderId || null,
+    google_subscription_state: params.googleSubscriptionState || null,
+    expires_at: params.expiresAt || null,
+    paid_at: params.paidAt || null,
+    raw_payload: params.rawPayload || null,
+  };
+
+  const legacyPayload = {
+    user_id: params.userId,
+    plan: params.plan,
+    status: params.status,
+    paid_at: params.paidAt || null,
+  };
+
+  let response = await postSubscription(
+    "subscriptions?on_conflict=purchase_token",
+    fullPayload,
+    "resolution=merge-duplicates,return=representation"
+  );
+  let primaryError = "";
+
+  if (!response.ok) {
+    primaryError = await response.text();
+    console.warn("[iap] full subscription upsert failed, retrying legacy payload:", primaryError);
+    response = await postSubscription("subscriptions", legacyPayload, "return=representation");
+  }
 
   if (!response.ok) {
     const err = await response.text();
-    throw new Error(`Supabase subscription upsert failed (${response.status}): ${err}`);
+    throw new Error(`Supabase subscription upsert failed (${response.status}): ${err || primaryError}`);
   }
 
   const data = await response.json();
