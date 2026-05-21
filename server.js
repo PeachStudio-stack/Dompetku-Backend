@@ -386,7 +386,7 @@ const PROMO_CODE_TABLE = "promo.codes";
 const RECURRING_RULE_TABLE = "recurring_transaction_rules";
 const RECURRING_RUN_TABLE = "recurring_transaction_runs";
 const DEFAULT_TIMEZONE = "Asia/Jakarta";
-const DEFAULT_ACCOUNT_NAME = "Cash / uang tunai";
+const DEFAULT_ACCOUNT_NAME = "Total Keuangan";
 const TRANSACTION_TOOL_PARAMETERS = {
   type: "object",
   properties: {
@@ -784,10 +784,10 @@ Return tool calls only for state-changing intent. Do not output JSON patch text.
 Rules:
 1) Use only available tools.
 2) For budget progress/spent updates, never set spent directly. Use transactions for spending.
-3) Every transaction should include an account wallet when possible.
-4) Never fabricate money movement if funds are clearly insufficient; choose suitable wallet.
-5) Prefer accurate Indonesian-friendly naming for budget, tabungan plan, and wallet.
-6) Use AddAkunDompet when user asks to add/create wallet account.
+3) Every transaction must use "Total Keuangan" as the account/wallet.
+4) Never fabricate money movement if funds are clearly insufficient.
+5) There is only one wallet/account named "Total Keuangan". Never create other wallets or suggest user create them.
+6) Do not use AddAkunDompet or createWallet. We only use a single consolidated "Total Keuangan".
 7) For income transaction, prefer fields: tanggal, jumlah, kategori, sumber, catatan.
 8) For expense transaction, prefer fields: tanggal, jumlah, kategori, metode, catatan.
 9) Classify transaction type by semantic money purpose, not by memorized keywords. Ask: after this transaction, did the user receive money, consume/spend money, move money into a savings goal, pay a liability, or convert cash into wealth/asset?
@@ -1056,6 +1056,34 @@ const applyPatch = (currentData, aiText) => {
   }
 
   return { finalData, textWithoutJson };
+};
+
+const buildOpenRouterMessages = (systemInstruction, history, currentPrompt, replyTo) => {
+  const openRouterMsgs = [{ role: "system", content: systemInstruction }];
+
+  const historyLimit = 8;
+  const filteredHistory = Array.isArray(history)
+    ? history
+        .filter((h) => h && typeof h.text === "string" && h.text.trim())
+        .slice(-historyLimit)
+    : [];
+
+  for (const h of filteredHistory) {
+    const role = h.role === "assistant" ? "assistant" : "user";
+    let text = h.text;
+    if (h.replyToText) {
+      text = `[Membalas pesan: "${h.replyToText}"]\n${text}`;
+    }
+    openRouterMsgs.push({ role, content: text });
+  }
+
+  let finalPrompt = String(currentPrompt || "");
+  if (replyTo && typeof replyTo.text === "string" && replyTo.text.trim()) {
+    finalPrompt = `[Membalas pesan: "${replyTo.text}"]\n${finalPrompt}`;
+  }
+  openRouterMsgs.push({ role: "user", content: finalPrompt });
+
+  return openRouterMsgs;
 };
 
 const openRouterFetch = async ({ model, timeoutMs, messages, maxTokens, stream, referer }) => {
@@ -2330,10 +2358,12 @@ app.post("/api/agent/actions", async (req, res) => {
     });
     const compactData = buildCompactData(currentData || {});
     const actionSystem = buildActionSystemInstruction(targetLanguage, compactData);
-    const messages = [
-      { role: "system", content: actionSystem },
-      { role: "user", content: safePrompt },
-    ];
+    const messages = buildOpenRouterMessages(
+      actionSystem,
+      req.body.history,
+      safePrompt,
+      req.body.replyTo
+    );
 
     let usedModel = primary;
     let fallbackUsed = false;
@@ -2581,10 +2611,12 @@ app.post("/api/chat", async (req, res) => {
     });
     const compactData = buildCompactData(currentData || {});
     const systemInstruction = buildSystemInstruction(targetLanguage, compactData);
-    const messages = [
-      { role: "system", content: systemInstruction },
-      { role: "user", content: String(prompt || "") },
-    ];
+    const messages = buildOpenRouterMessages(
+      systemInstruction,
+      req.body.history,
+      prompt,
+      req.body.replyTo
+    );
 
     let usedModel = primary;
     let fallbackUsed = false;
@@ -2675,10 +2707,12 @@ app.post("/api/chat/stream", async (req, res) => {
     });
     const compactData = buildCompactData(currentData || {});
     const systemInstruction = buildSystemInstruction(targetLanguage, compactData);
-    const messages = [
-      { role: "system", content: systemInstruction },
-      { role: "user", content: String(prompt || "") },
-    ];
+    const messages = buildOpenRouterMessages(
+      systemInstruction,
+      req.body.history,
+      prompt,
+      req.body.replyTo
+    );
 
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
