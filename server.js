@@ -10,6 +10,7 @@ const { JWT } = require("google-auth-library");
 
 const app = express();
 const pendingActionConfirmations = new Map();
+const pendingActionSelections = new Map();
 const ACTION_CONFIRM_TTL_MS = 10 * 60 * 1000;
 
 const PORT = Number(process.env.PORT || 3000);
@@ -176,14 +177,174 @@ const cleanupExpiredActionConfirmations = () => {
       pendingActionConfirmations.delete(id);
     }
   }
+  for (const [id, item] of pendingActionSelections.entries()) {
+    if (now - Number(item?.createdAt || 0) > ACTION_CONFIRM_TTL_MS) {
+      pendingActionSelections.delete(id);
+    }
+  }
 };
 
-const isDeleteLikeAction = (action) => String(action?.name || "").toLowerCase().includes("delete");
+const ACTION_CONFIRMATION_EXEMPTIONS = new Set(["calculateFinanceMetrics"]);
+const AGENT_ALLOWED_ACTIONS = new Set([
+  "createTabungan",
+  "createTabunganPlan",
+  "updateTabunganPlan",
+  "deleteTabunganPlan",
+  "addTabungan",
+  "createGoal",
+  "createBudget",
+  "updateBudget",
+  "deleteBudget",
+  "addTransaction",
+  "createTransaction",
+  "updateTransaction",
+  "deleteTransaction",
+  "bulkUpdateTransactions",
+  "bulkDeleteTransactions",
+]);
+const INVESTMENT_HINT_KEYWORDS = [
+  "bitcoin",
+  "btc",
+  "crypto",
+  "kripto",
+  "saham",
+  "emas",
+  "reksa",
+  "invest",
+  "investasi",
+];
+
+const formatAmountForSummary = (value) => {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0) return "";
+  return amount.toLocaleString("id-ID");
+};
+
+const summarizeActionForConfirmation = (action) => {
+  const name = String(action?.name || "").trim();
+  const args = isObject(action?.args) ? action.args : {};
+  const amount = formatAmountForSummary(args.amount || args.jumlah || args.limit || args.target || args.current);
+  const category = String(args.category || args.kategori || args.name || args.old_name || "").trim();
+
+  if (!name) return "Aksi perubahan data";
+  if (name === "addTransaction" || name === "createTransaction") {
+    const type = String(args.type || "").trim();
+    const wallet = String(args.account || "").trim();
+    const parts = [`Catat transaksi ${type || "baru"}`];
+    if (amount) parts.push(`Rp${amount}`);
+    if (category) parts.push(`kategori ${category}`);
+    if (wallet) parts.push(`dompet ${wallet}`);
+    return parts.join(" ");
+  }
+  if (name === "createTabungan" || name === "createTabunganPlan" || name === "createGoal" || name === "updateTabunganPlan") {
+    const parts = [name === "createGoal" || name === "updateTabunganPlan" ? "Perbarui tabungan" : "Buat tabungan"];
+    if (category) parts.push(`"${category}"`);
+    if (amount) parts.push(`target Rp${amount}`);
+    return parts.join(" ");
+  }
+  if (name === "addTabungan") {
+    const parts = ["Tambah tabungan"];
+    if (category) parts.push(`"${category}"`);
+    if (amount) parts.push(`Rp${amount}`);
+    return parts.join(" ");
+  }
+  if (name === "createWallet" || name === "AddAkunDompet") {
+    const parts = ["Buat dompet"];
+    if (category) parts.push(`"${category}"`);
+    if (amount) parts.push(`saldo awal Rp${amount}`);
+    return parts.join(" ");
+  }
+  if (name === "updateWallet") {
+    return `Perbarui dompet "${category || "dompet"}"`;
+  }
+  if (name === "deleteWallet") {
+    return `Hapus dompet "${category || "dompet"}"`;
+  }
+  if (name === "createBudget" || name === "updateBudget") {
+    const parts = [name === "createBudget" ? "Buat budget" : "Perbarui budget"];
+    if (category) parts.push(`"${category}"`);
+    if (amount) parts.push(`limit Rp${amount}`);
+    return parts.join(" ");
+  }
+  if (name === "deleteBudget") {
+    return `Hapus budget "${category || "budget"}"`;
+  }
+  if (name === "createCategory") {
+    return `Buat kategori "${category || "baru"}"`;
+  }
+  if (name === "renameCategory") {
+    const nextName = String(args.new_name || args.to || "").trim();
+    if (category && nextName) return `Ubah kategori "${category}" menjadi "${nextName}"`;
+    return "Ubah kategori";
+  }
+  if (name === "deleteCategory") {
+    return `Hapus kategori "${category || "kategori"}"`;
+  }
+  if (name === "updateTransaction") {
+    return `Perbarui transaksi "${String(args.id || "").trim() || "terpilih"}"`;
+  }
+  if (name === "deleteTransaction") {
+    return `Hapus transaksi "${String(args.id || "").trim() || "terpilih"}"`;
+  }
+  if (name === "bulkUpdateTransactions") return "Perbarui banyak transaksi";
+  if (name === "bulkDeleteTransactions") return "Hapus banyak transaksi";
+  if (name === "createRecurringRule") return "Buat jadwal transaksi otomatis";
+  if (name === "updateRecurringRule") return "Perbarui jadwal transaksi otomatis";
+  if (name === "pauseRecurringRule") return "Jeda jadwal transaksi otomatis";
+  if (name === "deleteRecurringRule") return "Hapus jadwal transaksi otomatis";
+  return name;
+};
 
 const buildConfirmationRequestMessage = (actions) => {
-  if (!Array.isArray(actions) || actions.length === 0) return "Konfirmasi aksi.";
-  if (actions.length === 1) return `Konfirmasi aksi hapus untuk ${actions[0].name}.`;
-  return `Konfirmasi ${actions.length} aksi hapus sekaligus.`;
+  if (!Array.isArray(actions) || actions.length === 0) return "Konfirmasi perubahan data.";
+  const preview = actions.slice(0, 4).map((action) => summarizeActionForConfirmation(action)).filter(Boolean);
+  const extra = actions.length > preview.length ? `, dan ${actions.length - preview.length} aksi lain` : "";
+  return `Ada ${actions.length} perubahan data yang menunggu konfirmasi: ${preview.join("; ")}${extra}.`;
+};
+
+const isConfirmationRequiredAction = (action) => {
+  const name = String(action?.name || "").trim();
+  if (!name) return false;
+  return !ACTION_CONFIRMATION_EXEMPTIONS.has(name);
+};
+
+const isAllowedAgentAction = (action) => AGENT_ALLOWED_ACTIONS.has(String(action?.name || "").trim());
+
+const isInvestmentPrompt = (prompt) => {
+  const text = normalizePromptText(prompt);
+  if (!text) return false;
+  return INVESTMENT_HINT_KEYWORDS.some((keyword) => text.includes(keyword));
+};
+
+const findRelatedEntityCandidates = (currentData, prompt) => {
+  const text = normalizePromptText(prompt);
+  if (!text) return [];
+  const candidates = [];
+  const tabunganPlans = isObject(currentData?.tabunganPlans) ? currentData.tabunganPlans : {};
+  const budgets = isObject(currentData?.budgets) ? currentData.budgets : {};
+
+  for (const name of Object.keys(tabunganPlans)) {
+    const slug = normalizePromptText(name);
+    if (slug && (text.includes(slug) || slug.split(" ").some((part) => part.length > 2 && text.includes(part)))) {
+      candidates.push({ type: "tabungan", name });
+    }
+  }
+  for (const name of Object.keys(budgets)) {
+    const slug = normalizePromptText(name);
+    if (slug && (text.includes(slug) || slug.split(" ").some((part) => part.length > 2 && text.includes(part)))) {
+      candidates.push({ type: "budget", name });
+    }
+  }
+  return candidates.slice(0, 3);
+};
+
+const getFirstTransactionAmount = (actions) => {
+  for (const action of Array.isArray(actions) ? actions : []) {
+    if (!["addTransaction", "createTransaction"].includes(String(action?.name || ""))) continue;
+    const amount = toNumber(action?.args?.amount || action?.args?.jumlah);
+    if (amount > 0) return amount;
+  }
+  return 0;
 };
 
 const txTypeToCategoryType = (value) => {
@@ -409,7 +570,7 @@ const TRANSACTION_TOOL_PARAMETERS = {
   },
   required: ["type"],
 };
-const AGENT_ACTION_TOOLS = [
+const AGENT_ACTION_TOOLS_RAW = [
   {
     type: "function",
     function: {
@@ -456,6 +617,38 @@ const AGENT_ACTION_TOOLS = [
           target: { type: "number" },
         },
         required: ["name", "target"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "updateTabunganPlan",
+      description: "Update target/current tabungan plan.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          target: { type: "number" },
+          current: { type: "number" },
+          note: { type: "string" },
+        },
+        required: ["name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "deleteTabunganPlan",
+      description: "Delete tabungan plan by name.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          reassign_to: { type: "string" },
+        },
+        required: ["name"],
       },
     },
   },
@@ -513,6 +706,20 @@ const AGENT_ACTION_TOOLS = [
   {
     type: "function",
     function: {
+      name: "deleteBudget",
+      description: "Delete budget by name.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+        },
+        required: ["name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "addTransaction",
       description:
         "Record a financial transaction. Use type=asset for buying/adding assets or investments such as Bitcoin, crypto, stocks, gold, mutual funds, property, vehicles, or valuables; this is a cash outflow but should increase assets, not expenses.",
@@ -526,6 +733,71 @@ const AGENT_ACTION_TOOLS = [
       description:
         "Alias for addTransaction. Record a financial transaction with the same type classification rules, including type=asset for buying/adding wealth or investments.",
       parameters: TRANSACTION_TOOL_PARAMETERS,
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "updateTransaction",
+      description: "Update an existing transaction.",
+      parameters: {
+        ...TRANSACTION_TOOL_PARAMETERS,
+        properties: {
+          ...TRANSACTION_TOOL_PARAMETERS.properties,
+          id: { type: "string" },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "deleteTransaction",
+      description: "Delete transaction by id.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "bulkUpdateTransactions",
+      description: "Bulk update existing transactions.",
+      parameters: {
+        type: "object",
+        properties: {
+          items: {
+            type: "array",
+            items: {
+              type: "object",
+            },
+          },
+        },
+        required: ["items"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "bulkDeleteTransactions",
+      description: "Bulk delete transactions by ids.",
+      parameters: {
+        type: "object",
+        properties: {
+          ids: {
+            type: "array",
+            items: { type: "string" },
+          },
+        },
+        required: ["ids"],
+      },
     },
   },
   {
@@ -629,6 +901,9 @@ const AGENT_ACTION_TOOLS = [
     },
   },
 ];
+const AGENT_ACTION_TOOLS = AGENT_ACTION_TOOLS_RAW.filter((tool) =>
+  AGENT_ALLOWED_ACTIONS.has(String(tool?.function?.name || ""))
+);
 
 const DEFAULT_ALLOWED_ORIGINS = [
   "http://localhost",
@@ -784,10 +1059,10 @@ Return tool calls only for state-changing intent. Do not output JSON patch text.
 Rules:
 1) Use only available tools.
 2) For budget progress/spent updates, never set spent directly. Use transactions for spending.
-3) Every transaction must use "Total Keuangan" as the account/wallet.
-4) Never fabricate money movement if funds are clearly insufficient.
-5) There is only one wallet/account named "Total Keuangan". Never create other wallets or suggest user create them.
-6) Do not use AddAkunDompet or createWallet. We only use a single consolidated "Total Keuangan".
+3) You are allowed to mutate only: budget, tabungan (savings plans), and transactions.
+4) Never use wallet tools, category tools, or recurring tools.
+5) Every transaction must use "Total Keuangan" as the account/wallet.
+6) Never fabricate money movement if funds are clearly insufficient.
 7) For income transaction, prefer fields: tanggal, jumlah, kategori, sumber, catatan.
 8) For expense transaction, prefer fields: tanggal, jumlah, kategori, metode, catatan.
 9) Classify transaction type by semantic money purpose, not by memorized keywords. Ask: after this transaction, did the user receive money, consume/spend money, move money into a savings goal, pay a liability, or convert cash into wealth/asset?
@@ -806,9 +1081,10 @@ Rules:
 13) If date is missing, still send transaction and let app use local today's date.
 14) You may call multiple tools when needed.
 15) If user asks pure analysis/advice without mutation intent, do not call tools.
-16) For recurring requests (tiap hari/minggu/bulan pada jam tertentu), use recurring tools.
-17) For transaction tools, include classification_reason and confidence when possible. Keep reason short.
-18) Response language: ${targetLanguage}.
+16) If user asks for advice/consultation/analysis, do not mutate data and do not call tools.
+17) If user asks features outside allowed mutate scope (wallet/category/recurring), explain briefly and stay in advisor mode.
+18) For transaction tools, include classification_reason and confidence when possible. Keep reason short.
+19) Response language: ${targetLanguage}.
 
 Compact context:
 ${JSON.stringify(compactData)}`;
@@ -2426,90 +2702,104 @@ app.post("/api/agent/actions", async (req, res) => {
     });
 
     cleanupExpiredActionConfirmations();
-    const knownCategoryMap = collectKnownCategoriesFromCurrentData(currentData || {});
+    const filteredActions = (Array.isArray(result.actions) ? result.actions : []).filter((action) =>
+      isAllowedAgentAction(action)
+    );
+    const droppedCount = (Array.isArray(result.actions) ? result.actions.length : 0) - filteredActions.length;
+
+    const hasTransactionAction = filteredActions.some((action) =>
+      ["addTransaction", "createTransaction", "updateTransaction", "deleteTransaction", "bulkUpdateTransactions", "bulkDeleteTransactions"].includes(
+        String(action?.name || "")
+      )
+    );
+    const candidates = hasTransactionAction && isInvestmentPrompt(safePrompt)
+      ? findRelatedEntityCandidates(currentData || {}, safePrompt)
+      : [];
+
+    const selectionRequests = [];
+    if (candidates.length && hasTransactionAction) {
+      const matched = candidates[0];
+      const selectionId = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      const txAmount = getFirstTransactionAmount(filteredActions);
+      const relateActions = [...filteredActions];
+      if (matched.type === "tabungan" && txAmount > 0) {
+        relateActions.push({
+          name: "addTabungan",
+          args: {
+            name: matched.name,
+            amount: txAmount,
+            note: "Catatan tambahan dari pilihan AI",
+            account: "Total Keuangan",
+          },
+        });
+      }
+
+      pendingActionSelections.set(selectionId, {
+        id: selectionId,
+        createdAt: Date.now(),
+        context: {
+          matchedEntity: matched,
+          candidates,
+        },
+        options: {
+          apply_related: {
+            actions: relateActions,
+            assistantText: `Siap, transaksi akan dikaitkan ke ${matched.type} "${matched.name}".`,
+          },
+          transaction_only: {
+            actions: filteredActions,
+            assistantText: "Siap, saya catat sebagai transaksi saja.",
+          },
+          cancel: {
+            actions: [],
+            assistantText: "Oke, tidak ada perubahan data.",
+          },
+        },
+      });
+
+      selectionRequests.push({
+        id: selectionId,
+        title: "Pilih Cara Pencatatan",
+        message: `Saya menemukan ${matched.type} terkait: "${matched.name}". Mau lanjut bagaimana?`,
+        matchedEntity: matched,
+        candidates,
+        options: [
+          { id: "apply_related", label: "Catat ke tabungan/budget terkait", description: "Transaksi + kaitkan ke target terkait", value: "apply_related" },
+          { id: "transaction_only", label: "Hanya catat transaksi", description: "Simpan transaksi saja", value: "transaction_only" },
+          { id: "cancel", label: "Batal", description: "Tidak ada perubahan data", value: "cancel" },
+        ],
+      });
+    }
+
     const directActions = [];
-    const deleteActions = [];
-    const unknownCategoryConfirmChains = [];
-    const unknownCategoryKeys = new Set();
-
-    for (const action of result.actions) {
-      if (isDeleteLikeAction(action)) {
-        deleteActions.push(action);
-        continue;
-      }
-
-      const categoryType = getActionCategoryType(action);
-      const categoryName = getActionCategoryName(action);
-      if (
-        categoryType &&
-        categoryName &&
-        categoryType !== "saving" &&
-        !knownCategoryMap[categoryType].has(normalizeCategorySlug(categoryName))
-      ) {
-        const key = `${categoryType}:${normalizeCategorySlug(categoryName)}`;
-        if (!unknownCategoryKeys.has(key)) {
-          unknownCategoryKeys.add(key);
-          unknownCategoryConfirmChains.push({
-            categoryType,
-            categoryName,
-            actions: [
-              {
-                name: "createCategory",
-                args: {
-                  category_type: categoryType,
-                  name: categoryName,
-                  source: "ai",
-                  section: categoryType === "income" ? "income" : categoryType === "expense" ? "expenses" : categoryType === "asset" ? "assets" : categoryType === "debt_payment" ? "debts" : "saving",
-                },
-              },
-              action,
-            ],
-          });
+    const confirmationActions = [];
+    if (!selectionRequests.length) {
+      for (const action of filteredActions) {
+        if (isConfirmationRequiredAction(action)) {
+          confirmationActions.push(action);
         } else {
-          const chain = unknownCategoryConfirmChains.find(
-            (item) => item.categoryType === categoryType && normalizeCategorySlug(item.categoryName) === normalizeCategorySlug(categoryName)
-          );
-          if (chain) chain.actions.push(action);
+          directActions.push(action);
         }
-        continue;
       }
-
-      directActions.push(action);
     }
 
     const confirmationRequests = [];
-    if (deleteActions.length) {
+    if (confirmationActions.length) {
       const confirmationId = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      const summary = buildConfirmationRequestMessage(confirmationActions);
       pendingActionConfirmations.set(confirmationId, {
         id: confirmationId,
         createdAt: Date.now(),
-        actions: deleteActions,
-        summary: buildConfirmationRequestMessage(deleteActions),
+        actions: confirmationActions,
+        summary,
       });
       confirmationRequests.push({
         id: confirmationId,
-        title: "Konfirmasi Aksi Hapus",
-        message: buildConfirmationRequestMessage(deleteActions),
-        actions: deleteActions,
-        kind: "delete",
-      });
-    }
-
-    for (const chain of unknownCategoryConfirmChains) {
-      const confirmationId = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-      const message = `Kategori "${chain.categoryName}" (${chain.categoryType}) belum ada. Konfirmasi untuk membuat kategori baru lalu lanjutkan transaksi.`;
-      pendingActionConfirmations.set(confirmationId, {
-        id: confirmationId,
-        createdAt: Date.now(),
-        actions: chain.actions,
-        summary: message,
-      });
-      confirmationRequests.push({
-        id: confirmationId,
-        title: "Konfirmasi Kategori Baru",
-        message,
-        actions: chain.actions,
-        kind: "unknown_category",
+        title: "Konfirmasi Perubahan Data",
+        message: summary,
+        summary,
+        actions: confirmationActions,
+        kind: "mutating",
       });
     }
 
@@ -2517,16 +2807,20 @@ app.post("/api/agent/actions", async (req, res) => {
       ok: true,
       actions: directActions,
       confirmationRequests,
+      selectionRequests,
       assistantText:
-        result.assistantText?.trim() ||
-        (confirmationRequests.length
-          ? "Perintah siap. Ada aksi yang menunggu konfirmasi kamu."
-          : "Siap, perubahan data keuangan sudah saya susun."),
+        selectionRequests.length
+          ? "Saya butuh pilihan kamu dulu sebelum mengeksekusi aksi."
+          : result.assistantText?.trim() ||
+            (confirmationRequests.length
+              ? "Perintah siap. Ada perubahan data yang menunggu konfirmasi kamu."
+              : "Siap, perubahan data keuangan sudah saya susun."),
       metadata: {
         processing_mode: "ai_actions",
         model_used: usedModel,
         fallback_used: fallbackUsed,
         retry_forced_tool_choice: retryForced,
+        dropped_actions: droppedCount,
         total_ms: Date.now() - started,
       },
     });
@@ -2585,6 +2879,68 @@ app.post("/api/agent/actions/cancel", async (req, res) => {
     return res.status(500).json({
       ok: false,
       error: error?.message || "Gagal membatalkan konfirmasi aksi.",
+    });
+  }
+});
+
+app.post("/api/agent/actions/select", async (req, res) => {
+  try {
+    const { selectionId, optionId } = req.body || {};
+    const id = String(selectionId || "").trim();
+    const option = String(optionId || "").trim();
+    if (!id || !option) {
+      return res.status(400).json({ ok: false, error: "selectionId dan optionId wajib diisi." });
+    }
+    cleanupExpiredActionConfirmations();
+    const pending = pendingActionSelections.get(id);
+    if (!pending) {
+      return res.status(404).json({ ok: false, error: "Pilihan tidak ditemukan atau kadaluarsa." });
+    }
+    const selected = pending?.options?.[option];
+    if (!selected) {
+      return res.status(400).json({ ok: false, error: "Opsi pilihan tidak valid." });
+    }
+    pendingActionSelections.delete(id);
+
+    const actions = Array.isArray(selected.actions)
+      ? selected.actions.filter((action) => isAllowedAgentAction(action))
+      : [];
+    if (!actions.length) {
+      return res.json({
+        ok: true,
+        actions: [],
+        confirmationRequests: [],
+        assistantText: selected.assistantText || "Tidak ada perubahan data.",
+      });
+    }
+
+    const confirmationId = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const summary = buildConfirmationRequestMessage(actions);
+    pendingActionConfirmations.set(confirmationId, {
+      id: confirmationId,
+      createdAt: Date.now(),
+      actions,
+      summary,
+    });
+    return res.json({
+      ok: true,
+      actions: [],
+      confirmationRequests: [
+        {
+          id: confirmationId,
+          title: "Konfirmasi Perubahan Data",
+          message: summary,
+          summary,
+          actions,
+          kind: "mutating",
+        },
+      ],
+      assistantText: selected.assistantText || "Pilihan diterima. Lanjut konfirmasi dulu ya.",
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      error: error?.message || "Gagal memproses pilihan.",
     });
   }
 });
