@@ -1,4 +1,4 @@
-﻿const path = require("path");
+const path = require("path");
 
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 
@@ -1792,11 +1792,201 @@ const supabaseRestFetch = async (pathWithQuery, init = {}) => {
 
 const firstRow = (value) => (Array.isArray(value) ? value[0] : value);
 
-const resolveUserAccessPlanFromDB = async (userId) => {
+const resolveFamilyContext = async (userId) => {
+  try {
+    // 1. Check if user is a member of a family
+    const memberRows = await supabaseRestFetch(
+      `family_members?user_id=eq.${encodeURIComponent(userId)}&select=family_id,role,can_create,can_edit,can_delete&limit=1`
+    ).catch(() => null);
+    const member = firstRow(memberRows);
+
+    if (member) {
+      const familyRows = await supabaseRestFetch(
+        `families?id=eq.${encodeURIComponent(member.family_id)}&select=owner_id,invite_code&limit=1`
+      ).catch(() => null);
+      const family = firstRow(familyRows);
+      if (family) {
+        return {
+          inFamily: true,
+          isOwner: false,
+          ownerId: family.owner_id,
+          inviteCode: family.invite_code,
+          role: "member",
+          permissions: {
+            can_create: !!member.can_create,
+            can_edit: !!member.can_edit,
+            can_delete: !!member.can_delete,
+          },
+          familyId: member.family_id,
+        };
+      }
+    }
+
+    // 2. Check if user is owner of a family
+    const ownerRows = await supabaseRestFetch(
+      `families?owner_id=eq.${encodeURIComponent(userId)}&select=id,invite_code&limit=1`
+    ).catch(() => null);
+    const ownerFamily = firstRow(ownerRows);
+
+    if (ownerFamily) {
+      const membersRows = await supabaseRestFetch(
+        `family_members?family_id=eq.${encodeURIComponent(ownerFamily.id)}&select=id,user_id,role,can_create,can_edit,can_delete,created_at`
+      ).catch(() => []);
+      const members = Array.isArray(membersRows) ? membersRows : [];
+      const membersWithProfiles = await Promise.all(
+        members.map(async (m) => {
+          const profileRows = await supabaseRestFetch(
+            `profiles?id=eq.${encodeURIComponent(m.user_id)}&select=display_name`
+          ).catch(() => null);
+          const profile = firstRow(profileRows);
+          return {
+            ...m,
+            display_name: profile?.display_name || "Anggota Keluarga",
+          };
+        })
+      );
+
+      return {
+        inFamily: true,
+        isOwner: true,
+        ownerId: userId,
+        inviteCode: ownerFamily.invite_code,
+        role: "owner",
+        permissions: {
+          can_create: true,
+          can_edit: true,
+          can_delete: true,
+        },
+        familyId: ownerFamily.id,
+        members: membersWithProfiles,
+      };
+    }
+
+    return {
+      inFamily: false,
+      isOwner: false,
+      ownerId: userId,
+      role: null,
+      permissions: null,
+      familyId: null,
+    };
+  } catch (err) {
+    console.error("[resolveFamilyContext] error:", err);
+    return {
+      inFamily: false,
+      isOwner: false,
+      ownerId: userId,
+      role: null,
+      permissions: null,
+      familyId: null,
+    };
+  }
+};
+
+const canUserCreateFamily = async (userId) => {
   try {
     const [overrideRows, subRows] = await Promise.all([
       supabaseRestFetch(`${ACCESS_OVERRIDE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=role&limit=1`).catch(() => null),
       supabaseRestFetch(`${SUBSCRIPTION_TABLE}?user_id=eq.${encodeURIComponent(userId)}&status=eq.active&select=plan,status&order=created_at.desc&limit=1`).catch(() => null),
+    ]);
+    const override = firstRow(overrideRows);
+    if (override?.role === "admin") return true;
+
+    const sub = firstRow(subRows);
+    if (sub?.status === "active" && (sub.plan === "family" || sub.plan === "family_pro" || sub.plan === "premium")) {
+      return true;
+    }
+    return false;
+  } catch (err) {
+    console.error("[canUserCreateFamily] failed:", err);
+    return false;
+  }
+};
+
+const validateSnapshotPermissions = (oldSnapshot, newSnapshot, permissions) => {
+  const oldTxs = oldSnapshot?.transactions || [];
+  const newTxs = newSnapshot?.transactions || [];
+
+  const oldMap = new Map(oldTxs.map(t => [t.id, t]));
+  const newMap = new Map(newTxs.map(t => [t.id, t]));
+
+  let hasCreate = false;
+  let hasEdit = false;
+  let hasDelete = false;
+
+  for (const newTx of newTxs) {
+    const oldTx = oldMap.get(newTx.id);
+    if (!oldTx) {
+      hasCreate = true;
+    } else {
+      if (
+        newTx.amount !== oldTx.amount ||
+        newTx.category !== oldTx.category ||
+        newTx.description !== oldTx.description ||
+        newTx.date !== oldTx.date ||
+        newTx.type !== oldTx.type ||
+        newTx.account !== oldTx.account ||
+        newTx.note !== oldTx.note ||
+        newTx.method !== oldTx.method
+      ) {
+        hasEdit = true;
+      }
+    }
+  }
+
+  for (const oldTx of oldTxs) {
+    if (!newMap.has(oldTx.id)) {
+      hasDelete = true;
+    }
+  }
+
+  let hasNonTxEdits = false;
+  if (!permissions.can_edit) {
+    const fieldsToCheck = ['budgets', 'goals', 'tabunganPlans', 'wallets', 'categories', 'metadata'];
+    for (const f of fieldsToCheck) {
+      if (JSON.stringify(oldSnapshot[f]) !== JSON.stringify(newSnapshot[f])) {
+        hasNonTxEdits = true;
+        break;
+      }
+    }
+  }
+
+  if (hasCreate && !permissions.can_create) {
+    return { ok: false, error: "Anda tidak memiliki izin untuk menambah transaksi." };
+  }
+  if (hasEdit && !permissions.can_edit) {
+    return { ok: false, error: "Anda tidak memiliki izin untuk mengubah transaksi." };
+  }
+  if (hasDelete && !permissions.can_delete) {
+    return { ok: false, error: "Anda tidak memiliki izin untuk menghapus transaksi." };
+  }
+  if (hasNonTxEdits && !permissions.can_edit) {
+    return { ok: false, error: "Anda tidak memiliki izin untuk mengubah anggaran, tabungan, dompet, atau kategori keluarga." };
+  }
+
+  return { ok: true };
+};
+
+const resolveUserAccessPlanFromDB = async (userId) => {
+  try {
+    const memberRows = await supabaseRestFetch(
+      `family_members?user_id=eq.${encodeURIComponent(userId)}&select=family_id&limit=1`
+    ).catch(() => null);
+    const member = firstRow(memberRows);
+    let targetUserId = userId;
+    if (member) {
+      const familyRows = await supabaseRestFetch(
+        `families?id=eq.${encodeURIComponent(member.family_id)}&select=owner_id&limit=1`
+      ).catch(() => null);
+      const family = firstRow(familyRows);
+      if (family) {
+        targetUserId = family.owner_id;
+      }
+    }
+
+    const [overrideRows, subRows] = await Promise.all([
+      supabaseRestFetch(`${ACCESS_OVERRIDE_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&select=role&limit=1`).catch(() => null),
+      supabaseRestFetch(`${SUBSCRIPTION_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&status=eq.active&select=plan,status&order=created_at.desc&limit=1`).catch(() => null),
     ]);
     const override = firstRow(overrideRows);
     if (override?.role === "admin") return "admin";
@@ -1981,18 +2171,21 @@ const readUserBootstrapData = async (userId) => {
     }
   };
 
+  const familyContext = await resolveFamilyContext(userId);
+  const targetUserIdForSub = familyContext.inFamily ? familyContext.ownerId : userId;
+
   const [profile, subscription, accessOverride] = await Promise.all([
     readOrNull("profile", `profiles?id=eq.${encodeURIComponent(userId)}&select=display_name,referral_code`),
     readOrNull(
       "subscription",
       `subscriptions?user_id=eq.${encodeURIComponent(
-        userId
+        targetUserIdForSub
       )}&status=eq.active&select=plan,status,created_at&order=created_at.desc&limit=1`
     ),
     readOrNull(
       "access override",
       `${ACCESS_OVERRIDE_TABLE}?user_id=eq.${encodeURIComponent(
-        userId
+        targetUserIdForSub
       )}&select=role,daily_task_limit,input_char_limit,note,updated_at`
     ),
   ]);
@@ -2014,6 +2207,7 @@ const readUserBootstrapData = async (userId) => {
           updated_at: accessOverride.updated_at || null,
         }
       : null,
+    familyContext,
   };
 };
 
@@ -2268,17 +2462,20 @@ app.patch("/api/me/profile", requireSupabaseUser, async (req, res) => {
 app.get("/api/accounting-snapshot", requireSupabaseUser, async (req, res) => {
   try {
     const userId = req.authUser.id;
+    const familyCtx = await resolveFamilyContext(userId);
+    const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+
     const rows = await supabaseRestFetch(
-      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=accounting_data,data_version,updated_at`
+      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&select=accounting_data,data_version,updated_at`
     );
     const snapshot = firstRow(rows);
-    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(userId, snapshot?.accounting_data || {});
+    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(targetUserId, snapshot?.accounting_data || {});
     await supabaseRestFetch(`${FINANCE_TABLE}?on_conflict=user_id`, {
       method: "POST",
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify([
         {
-          user_id: userId,
+          user_id: targetUserId,
           accounting_data: mirrored,
           data_version: Number(snapshot?.data_version || Date.now()),
           updated_at: new Date().toISOString(),
@@ -2298,19 +2495,34 @@ app.get("/api/accounting-snapshot", requireSupabaseUser, async (req, res) => {
 app.put("/api/accounting-snapshot", requireSupabaseUser, async (req, res) => {
   try {
     const userId = req.authUser.id;
+    const familyCtx = await resolveFamilyContext(userId);
+    const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
     const accountingData = normalizeAccountingData(req.body?.accountingData || req.body?.accounting_data || {});
+
+    // Enforce permissions for family members
+    if (familyCtx.inFamily && !familyCtx.isOwner) {
+      const oldRows = await supabaseRestFetch(
+        `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&select=accounting_data`
+      ).catch(() => null);
+      const oldSnapshot = firstRow(oldRows)?.accounting_data || {};
+      const validation = validateSnapshotPermissions(oldSnapshot, accountingData, familyCtx.permissions);
+      if (!validation.ok) {
+        return res.status(403).json({ error: validation.error });
+      }
+    }
+
     await upsertMasterCategories(
-      userId,
+      targetUserId,
       collectCategorySeedsFromSnapshot(accountingData).map((item) => ({ ...item, source: "snapshot_sync" }))
     );
-    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(userId, accountingData);
+    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(targetUserId, accountingData);
     const dataVersion = Date.now();
     await supabaseRestFetch(`${FINANCE_TABLE}?on_conflict=user_id`, {
       method: "POST",
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify([
         {
-          user_id: userId,
+          user_id: targetUserId,
           accounting_data: mirrored,
           data_version: dataVersion,
           updated_at: new Date().toISOString(),
@@ -2326,15 +2538,18 @@ app.put("/api/accounting-snapshot", requireSupabaseUser, async (req, res) => {
 app.get("/api/categories", requireSupabaseUser, async (req, res) => {
   try {
     const userId = req.authUser.id;
+    const familyCtx = await resolveFamilyContext(userId);
+    const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+
     const includeArchived = String(req.query.include_archived || "false").toLowerCase() === "true";
-    let categories = await readUserMasterCategories(userId, includeArchived);
+    let categories = await readUserMasterCategories(targetUserId, includeArchived);
     if (!categories.length) {
       const snapshotRows = await supabaseRestFetch(
-        `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=accounting_data`
+        `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&select=accounting_data`
       );
       const snapshot = firstRow(snapshotRows);
-      await ensureCategoryMasterAndMirrorSnapshot(userId, snapshot?.accounting_data || {});
-      categories = await readUserMasterCategories(userId, includeArchived);
+      await ensureCategoryMasterAndMirrorSnapshot(targetUserId, snapshot?.accounting_data || {});
+      categories = await readUserMasterCategories(targetUserId, includeArchived);
     }
     return res.json({ categories });
   } catch (error) {
@@ -2345,13 +2560,20 @@ app.get("/api/categories", requireSupabaseUser, async (req, res) => {
 app.post("/api/categories", requireSupabaseUser, async (req, res) => {
   try {
     const userId = req.authUser.id;
+    const familyCtx = await resolveFamilyContext(userId);
+    const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+
+    if (familyCtx.inFamily && !familyCtx.permissions.can_edit) {
+      return res.status(403).json({ error: "Anda tidak memiliki izin untuk menambah kategori keluarga." });
+    }
+
     const categoryType = normalizeCategoryType(req.body?.category_type || req.body?.type || req.body?.section);
     const name = normalizeCategoryName(req.body?.name);
     if (!categoryType || !name) {
       return res.status(400).json({ error: "category_type dan name wajib diisi." });
     }
 
-    const rows = await upsertMasterCategories(userId, [
+    const rows = await upsertMasterCategories(targetUserId, [
       {
         category_type: categoryType,
         name,
@@ -2360,16 +2582,16 @@ app.post("/api/categories", requireSupabaseUser, async (req, res) => {
     ]);
 
     const snapshotRows = await supabaseRestFetch(
-      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=accounting_data,data_version`
+      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&select=accounting_data,data_version`
     );
     const snapshot = firstRow(snapshotRows);
-    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(userId, snapshot?.accounting_data || {});
+    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(targetUserId, snapshot?.accounting_data || {});
     await supabaseRestFetch(`${FINANCE_TABLE}?on_conflict=user_id`, {
       method: "POST",
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify([
         {
-          user_id: userId,
+          user_id: targetUserId,
           accounting_data: mirrored,
           data_version: Date.now(),
           updated_at: new Date().toISOString(),
@@ -2386,6 +2608,13 @@ app.post("/api/categories", requireSupabaseUser, async (req, res) => {
 app.patch("/api/categories/:id", requireSupabaseUser, async (req, res) => {
   try {
     const userId = req.authUser.id;
+    const familyCtx = await resolveFamilyContext(userId);
+    const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+
+    if (familyCtx.inFamily && !familyCtx.permissions.can_edit) {
+      return res.status(403).json({ error: "Anda tidak memiliki izin untuk mengubah kategori keluarga." });
+    }
+
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).json({ error: "Category id wajib diisi." });
 
@@ -2403,7 +2632,7 @@ app.patch("/api/categories/:id", requireSupabaseUser, async (req, res) => {
     }
 
     const rows = await supabaseRestFetch(
-      `${CATEGORY_TABLE}?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}&select=id,user_id,category_type,name,normalized_name,is_archived,source,created_at,updated_at`,
+      `${CATEGORY_TABLE}?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(targetUserId)}&select=id,user_id,category_type,name,normalized_name,is_archived,source,created_at,updated_at`,
       {
         method: "PATCH",
         headers: { Prefer: "return=representation" },
@@ -2414,16 +2643,16 @@ app.patch("/api/categories/:id", requireSupabaseUser, async (req, res) => {
     if (!category) return res.status(404).json({ error: "Category tidak ditemukan." });
 
     const snapshotRows = await supabaseRestFetch(
-      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=accounting_data,data_version`
+      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&select=accounting_data,data_version`
     );
     const snapshot = firstRow(snapshotRows);
-    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(userId, snapshot?.accounting_data || {});
+    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(targetUserId, snapshot?.accounting_data || {});
     await supabaseRestFetch(`${FINANCE_TABLE}?on_conflict=user_id`, {
       method: "POST",
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify([
         {
-          user_id: userId,
+          user_id: targetUserId,
           accounting_data: mirrored,
           data_version: Date.now(),
           updated_at: new Date().toISOString(),
@@ -2440,11 +2669,18 @@ app.patch("/api/categories/:id", requireSupabaseUser, async (req, res) => {
 app.post("/api/categories/:id/archive", requireSupabaseUser, async (req, res) => {
   try {
     const userId = req.authUser.id;
+    const familyCtx = await resolveFamilyContext(userId);
+    const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+
+    if (familyCtx.inFamily && !familyCtx.permissions.can_edit) {
+      return res.status(403).json({ error: "Anda tidak memiliki izin untuk mengarsipkan kategori keluarga." });
+    }
+
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).json({ error: "Category id wajib diisi." });
 
     const rows = await supabaseRestFetch(
-      `${CATEGORY_TABLE}?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}&select=id,user_id,category_type,name,normalized_name,is_archived,source,created_at,updated_at`,
+      `${CATEGORY_TABLE}?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(targetUserId)}&select=id,user_id,category_type,name,normalized_name,is_archived,source,created_at,updated_at`,
       {
         method: "PATCH",
         headers: { Prefer: "return=representation" },
@@ -2455,16 +2691,16 @@ app.post("/api/categories/:id/archive", requireSupabaseUser, async (req, res) =>
     if (!category) return res.status(404).json({ error: "Category tidak ditemukan." });
 
     const snapshotRows = await supabaseRestFetch(
-      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=accounting_data,data_version`
+      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&select=accounting_data,data_version`
     );
     const snapshot = firstRow(snapshotRows);
-    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(userId, snapshot?.accounting_data || {});
+    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(targetUserId, snapshot?.accounting_data || {});
     await supabaseRestFetch(`${FINANCE_TABLE}?on_conflict=user_id`, {
       method: "POST",
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify([
         {
-          user_id: userId,
+          user_id: targetUserId,
           accounting_data: mirrored,
           data_version: Date.now(),
           updated_at: new Date().toISOString(),
@@ -2481,11 +2717,18 @@ app.post("/api/categories/:id/archive", requireSupabaseUser, async (req, res) =>
 app.post("/api/categories/:id/unarchive", requireSupabaseUser, async (req, res) => {
   try {
     const userId = req.authUser.id;
+    const familyCtx = await resolveFamilyContext(userId);
+    const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+
+    if (familyCtx.inFamily && !familyCtx.permissions.can_edit) {
+      return res.status(403).json({ error: "Anda tidak memiliki izin untuk mengaktifkan kembali kategori keluarga." });
+    }
+
     const id = String(req.params.id || "").trim();
     if (!id) return res.status(400).json({ error: "Category id wajib diisi." });
 
     const rows = await supabaseRestFetch(
-      `${CATEGORY_TABLE}?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(userId)}&select=id,user_id,category_type,name,normalized_name,is_archived,source,created_at,updated_at`,
+      `${CATEGORY_TABLE}?id=eq.${encodeURIComponent(id)}&user_id=eq.${encodeURIComponent(targetUserId)}&select=id,user_id,category_type,name,normalized_name,is_archived,source,created_at,updated_at`,
       {
         method: "PATCH",
         headers: { Prefer: "return=representation" },
@@ -2496,16 +2739,16 @@ app.post("/api/categories/:id/unarchive", requireSupabaseUser, async (req, res) 
     if (!category) return res.status(404).json({ error: "Category tidak ditemukan." });
 
     const snapshotRows = await supabaseRestFetch(
-      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=accounting_data,data_version`
+      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&select=accounting_data,data_version`
     );
     const snapshot = firstRow(snapshotRows);
-    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(userId, snapshot?.accounting_data || {});
+    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(targetUserId, snapshot?.accounting_data || {});
     await supabaseRestFetch(`${FINANCE_TABLE}?on_conflict=user_id`, {
       method: "POST",
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify([
         {
-          user_id: userId,
+          user_id: targetUserId,
           accounting_data: mirrored,
           data_version: Date.now(),
           updated_at: new Date().toISOString(),
@@ -2522,8 +2765,11 @@ app.post("/api/categories/:id/unarchive", requireSupabaseUser, async (req, res) 
 app.get("/api/recurring-rules", requireSupabaseUser, async (req, res) => {
   try {
     const userId = req.authUser.id;
+    const familyCtx = await resolveFamilyContext(userId);
+    const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+
     const rows = await supabaseRestFetch(
-      `${RECURRING_RULE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&order=created_at.desc`
+      `${RECURRING_RULE_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&order=created_at.desc`
     );
     return res.json({ rules: Array.isArray(rows) ? rows : [] });
   } catch (error) {
@@ -2534,7 +2780,14 @@ app.get("/api/recurring-rules", requireSupabaseUser, async (req, res) => {
 app.post("/api/recurring-rules", requireSupabaseUser, async (req, res) => {
   try {
     const userId = req.authUser.id;
-    const input = normalizeRecurringRuleInput(req.body || {}, userId, new Date());
+    const familyCtx = await resolveFamilyContext(userId);
+    const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+
+    if (familyCtx.inFamily && !familyCtx.permissions.can_create) {
+      return res.status(403).json({ error: "Anda tidak memiliki izin untuk menambah aturan transaksi berulang." });
+    }
+
+    const input = normalizeRecurringRuleInput(req.body || {}, targetUserId, new Date());
     const rows = await supabaseRestFetch(`${RECURRING_RULE_TABLE}?select=*`, {
       method: "POST",
       headers: { Prefer: "return=representation" },
@@ -2551,9 +2804,16 @@ app.patch("/api/recurring-rules/:id", requireSupabaseUser, async (req, res) => {
   try {
     const ruleId = String(req.params.id || "").trim();
     const userId = req.authUser.id;
+    const familyCtx = await resolveFamilyContext(userId);
+    const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+
+    if (familyCtx.inFamily && !familyCtx.permissions.can_edit) {
+      return res.status(403).json({ error: "Anda tidak memiliki izin untuk mengubah aturan transaksi berulang." });
+    }
+
     if (!ruleId) return res.status(400).json({ error: "rule id is required." });
     const currentRows = await supabaseRestFetch(
-      `${RECURRING_RULE_TABLE}?id=eq.${encodeURIComponent(ruleId)}&user_id=eq.${encodeURIComponent(userId)}&select=*`
+      `${RECURRING_RULE_TABLE}?id=eq.${encodeURIComponent(ruleId)}&user_id=eq.${encodeURIComponent(targetUserId)}&select=*`
     );
     const current = Array.isArray(currentRows) ? currentRows[0] : currentRows;
     if (!current) return res.status(404).json({ error: "Recurring rule not found." });
@@ -2562,8 +2822,8 @@ app.patch("/api/recurring-rules/:id", requireSupabaseUser, async (req, res) => {
       ...current,
       ...req.body,
     };
-    const next = normalizeRecurringRuleInput(mergedInput, userId, new Date());
-    const updated = await updateRecurringRuleRow(ruleId, { ...next, user_id: userId });
+    const next = normalizeRecurringRuleInput(mergedInput, targetUserId, new Date());
+    const updated = await updateRecurringRuleRow(ruleId, { ...next, user_id: targetUserId });
     return res.json({ rule: updated });
   } catch (error) {
     return res.status(500).json({ error: error?.message || "Failed to update recurring rule." });
@@ -2574,9 +2834,16 @@ app.delete("/api/recurring-rules/:id", requireSupabaseUser, async (req, res) => 
   try {
     const ruleId = String(req.params.id || "").trim();
     const userId = req.authUser.id;
+    const familyCtx = await resolveFamilyContext(userId);
+    const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+
+    if (familyCtx.inFamily && !familyCtx.permissions.can_delete) {
+      return res.status(403).json({ error: "Anda tidak memiliki izin untuk menghapus aturan transaksi berulang." });
+    }
+
     if (!ruleId) return res.status(400).json({ error: "rule id is required." });
     await supabaseRestFetch(
-      `${RECURRING_RULE_TABLE}?id=eq.${encodeURIComponent(ruleId)}&user_id=eq.${encodeURIComponent(userId)}`,
+      `${RECURRING_RULE_TABLE}?id=eq.${encodeURIComponent(ruleId)}&user_id=eq.${encodeURIComponent(targetUserId)}`,
       {
         method: "DELETE",
         headers: { Prefer: "return=minimal" },
@@ -2591,9 +2858,12 @@ app.delete("/api/recurring-rules/:id", requireSupabaseUser, async (req, res) => 
 app.get("/api/recurring-runs", requireSupabaseUser, async (req, res) => {
   try {
     const userId = req.authUser.id;
+    const familyCtx = await resolveFamilyContext(userId);
+    const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+
     const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
     const rows = await supabaseRestFetch(
-      `${RECURRING_RUN_TABLE}?user_id=eq.${encodeURIComponent(userId)}&order=created_at.desc&limit=${limit}`
+      `${RECURRING_RUN_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&order=created_at.desc&limit=${limit}`
     );
     return res.json({ runs: Array.isArray(rows) ? rows : [] });
   } catch (error) {
@@ -2605,12 +2875,19 @@ app.post("/api/recurring-rules/:id/sync-timezone", requireSupabaseUser, async (r
   try {
     const ruleId = String(req.params.id || "").trim();
     const userId = req.authUser.id;
+    const familyCtx = await resolveFamilyContext(userId);
+    const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+
+    if (familyCtx.inFamily && !familyCtx.permissions.can_edit) {
+      return res.status(403).json({ error: "Anda tidak memiliki izin untuk mensinkronisasi timezone aturan keluarga." });
+    }
+
     const timezoneName = String(req.body?.timezone_name || "").trim();
     if (!ruleId || !timezoneName) {
       return res.status(400).json({ error: "rule id and timezone_name are required." });
     }
     const currentRows = await supabaseRestFetch(
-      `${RECURRING_RULE_TABLE}?id=eq.${encodeURIComponent(ruleId)}&user_id=eq.${encodeURIComponent(userId)}&select=*`
+      `${RECURRING_RULE_TABLE}?id=eq.${encodeURIComponent(ruleId)}&user_id=eq.${encodeURIComponent(targetUserId)}&select=*`
     );
     const current = Array.isArray(currentRows) ? currentRows[0] : currentRows;
     if (!current) return res.status(404).json({ error: "Recurring rule not found." });
@@ -2618,7 +2895,7 @@ app.post("/api/recurring-rules/:id/sync-timezone", requireSupabaseUser, async (r
       ...current,
       timezone_name: timezoneName,
     };
-    const normalized = normalizeRecurringRuleInput(merged, userId, new Date());
+    const normalized = normalizeRecurringRuleInput(merged, targetUserId, new Date());
     const updated = await updateRecurringRuleRow(ruleId, {
       timezone_name: timezoneName,
       timezone_mode: "device",
@@ -2627,6 +2904,208 @@ app.post("/api/recurring-rules/:id/sync-timezone", requireSupabaseUser, async (r
     return res.json({ rule: updated });
   } catch (error) {
     return res.status(500).json({ error: error?.message || "Failed to sync timezone." });
+app.post("/api/family/create", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = req.authUser.id;
+    
+    // 1. Check if user is already in a family
+    const familyCtx = await resolveFamilyContext(userId);
+    if (familyCtx.inFamily) {
+      return res.status(400).json({ error: "Anda sudah terdaftar dalam sebuah keluarga." });
+    }
+
+    // 2. Check if eligible (premium subscription / family package)
+    const eligible = await canUserCreateFamily(userId);
+    if (!eligible) {
+      return res.status(403).json({ error: "Akun Anda harus berlangganan paket Family atau Family Pro untuk membuat keluarga." });
+    }
+
+    // 3. Generate unique invite code
+    let inviteCode = "";
+    let attempts = 0;
+    while (attempts < 5) {
+      const rand = Math.random().toString(36).substring(2, 8).toUpperCase();
+      const existing = await supabaseRestFetch(`families?invite_code=eq.${encodeURIComponent(rand)}&select=id&limit=1`).catch(() => null);
+      if (!firstRow(existing)) {
+        inviteCode = rand;
+        break;
+      }
+      attempts++;
+    }
+    if (!inviteCode) {
+      inviteCode = "FAM" + Math.floor(100 + Math.random() * 900);
+    }
+
+    // 4. Insert row
+    const payload = {
+      owner_id: userId,
+      invite_code: inviteCode,
+    };
+    const createdRows = await supabaseRestFetch("families", {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify([payload]),
+    });
+    const createdFamily = firstRow(createdRows);
+    
+    return res.json({ ok: true, family: createdFamily });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Gagal membuat keluarga." });
+  }
+});
+
+app.post("/api/family/join", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = req.authUser.id;
+    const inviteCode = String(req.body?.invite_code || req.body?.inviteCode || "").trim().toUpperCase();
+    if (!inviteCode) {
+      return res.status(400).json({ error: "Invite code wajib diisi." });
+    }
+
+    // 1. Check if user is already in a family
+    const familyCtx = await resolveFamilyContext(userId);
+    if (familyCtx.inFamily) {
+      return res.status(400).json({ error: "Anda sudah terdaftar dalam sebuah keluarga. Silakan keluar terlebih dahulu." });
+    }
+
+    // 2. Find family
+    const familyRows = await supabaseRestFetch(`families?invite_code=eq.${encodeURIComponent(inviteCode)}&select=id,owner_id`).catch(() => null);
+    const family = firstRow(familyRows);
+    if (!family) {
+      return res.status(404).json({ error: "Kode undangan keluarga tidak ditemukan." });
+    }
+
+    if (family.owner_id === userId) {
+      return res.status(400).json({ error: "Anda adalah pemilik keluarga ini." });
+    }
+
+    // 3. Create family member
+    const memberPayload = {
+      family_id: family.id,
+      user_id: userId,
+      role: "member",
+      can_create: true,
+      can_edit: false,
+      can_delete: false,
+    };
+    const insertedRows = await supabaseRestFetch("family_members", {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify([memberPayload]),
+    });
+    
+    return res.json({ ok: true, member: firstRow(insertedRows) });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Gagal bergabung ke keluarga." });
+  }
+});
+
+app.post("/api/family/leave", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = req.authUser.id;
+
+    // Check if they are a member
+    const memberRows = await supabaseRestFetch(`family_members?user_id=eq.${encodeURIComponent(userId)}&select=id&limit=1`).catch(() => null);
+    const member = firstRow(memberRows);
+    if (!member) {
+      return res.status(400).json({ error: "Anda tidak terdaftar sebagai anggota keluarga manapun." });
+    }
+
+    // Delete member row
+    await supabaseRestFetch(`family_members?id=eq.${encodeURIComponent(member.id)}`, {
+      method: "DELETE",
+    });
+
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Gagal keluar dari keluarga." });
+  }
+});
+
+app.post("/api/family/members/:memberId/permissions", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = req.authUser.id;
+    const memberId = String(req.params.memberId || "").trim();
+    const { can_create, can_edit, can_delete } = req.body;
+
+    // Check if owner
+    const familyRows = await supabaseRestFetch(`families?owner_id=eq.${encodeURIComponent(userId)}&select=id&limit=1`).catch(() => null);
+    const family = firstRow(familyRows);
+    if (!family) {
+      return res.status(403).json({ error: "Hanya pemilik keluarga yang dapat mengatur izin." });
+    }
+
+    // Check if member is in family
+    const memberRows = await supabaseRestFetch(`family_members?id=eq.${encodeURIComponent(memberId)}&family_id=eq.${encodeURIComponent(family.id)}&select=id`).catch(() => null);
+    const member = firstRow(memberRows);
+    if (!member) {
+      return res.status(404).json({ error: "Anggota tidak ditemukan dalam keluarga Anda." });
+    }
+
+    const patch = {};
+    if (can_create !== undefined) patch.can_create = !!can_create;
+    if (can_edit !== undefined) patch.can_edit = !!can_edit;
+    if (can_delete !== undefined) patch.can_delete = !!can_delete;
+    patch.updated_at = new Date().toISOString();
+
+    await supabaseRestFetch(`family_members?id=eq.${encodeURIComponent(memberId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    });
+
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Gagal memperbarui izin anggota." });
+  }
+});
+
+app.delete("/api/family/members/:memberId", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = req.authUser.id;
+    const memberId = String(req.params.memberId || "").trim();
+
+    // Check if owner
+    const familyRows = await supabaseRestFetch(`families?owner_id=eq.${encodeURIComponent(userId)}&select=id&limit=1`).catch(() => null);
+    const family = firstRow(familyRows);
+    if (!family) {
+      return res.status(403).json({ error: "Hanya pemilik keluarga yang dapat mengeluarkan anggota." });
+    }
+
+    // Check if member is in family
+    const memberRows = await supabaseRestFetch(`family_members?id=eq.${encodeURIComponent(memberId)}&family_id=eq.${encodeURIComponent(family.id)}&select=id`).catch(() => null);
+    const member = firstRow(memberRows);
+    if (!member) {
+      return res.status(404).json({ error: "Anggota tidak ditemukan dalam keluarga Anda." });
+    }
+
+    await supabaseRestFetch(`family_members?id=eq.${encodeURIComponent(memberId)}`, {
+      method: "DELETE",
+    });
+
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Gagal mengeluarkan anggota." });
+  }
+});
+
+app.delete("/api/family/delete", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = req.authUser.id;
+
+    // Check if owner
+    const familyRows = await supabaseRestFetch(`families?owner_id=eq.${encodeURIComponent(userId)}&select=id&limit=1`).catch(() => null);
+    const family = firstRow(familyRows);
+    if (!family) {
+      return res.status(404).json({ error: "Anda tidak memiliki keluarga aktif untuk dihapus." });
+    }
+
+    await supabaseRestFetch(`families?id=eq.${encodeURIComponent(family.id)}`, {
+      method: "DELETE",
+    });
+
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Gagal membubarkan keluarga." });
   }
 });
 
@@ -3228,7 +3707,7 @@ Rules:
 - Practical and directly actionable
 - No numbering, no markdown, no explanation
 - Return valid JSON object only: {"suggestions":["...","...","..."]}`;
-    const usedModel = isFreeAccess(accessPlan) ? OPENROUTER_MODEL_FREE : OPENROUTER_MODEL_QUICK_SUGGEST;
+    const usedModel = isFreeAccess(accessPlan) ? OPENROUTER_MODEL_FREE : (OPENROUTER_MODEL_QUICK_SUGGEST.includes(":free") ? OPENROUTER_MODEL_FAST : OPENROUTER_MODEL_QUICK_SUGGEST);
     logAiRoute("/api/quick-suggestions", {
       accessPlan: accessPlan || "free",
       inputChars: query.length,
@@ -3269,18 +3748,36 @@ Rules:
 app.post("/api/report/recommendations", async (req, res) => {
   const started = Date.now();
   try {
-    const { currentData, language } = req.body || {};
+    const { currentData, language, accessPlan: clientAccessPlan } = req.body || {};
     const targetLanguage = String(language || "Indonesian");
     if (!currentData || typeof currentData !== "object") {
       return res.status(400).json({ error: "Missing currentData." });
     }
 
+    // Server-side subscription verification
+    let accessPlan = clientAccessPlan || "free";
+    const bearerToken = getBearerTokenFromRequest(req);
+    if (bearerToken) {
+      try {
+        const authUser = await verifySupabaseUserAccessToken(bearerToken);
+        if (authUser?.id) {
+          const dbPlan = await resolveUserAccessPlanFromDB(authUser.id);
+          if (dbPlan !== null) accessPlan = dbPlan;
+        }
+      } catch (_authErr) { /* non-authed request */ }
+    }
+
+    const usedModel = isFreeAccess(accessPlan)
+      ? (OPENROUTER_MODEL_REPORT_RECOMMENDATION.includes(":free") ? OPENROUTER_MODEL_REPORT_RECOMMENDATION : "deepseek/deepseek-v4-flash:free")
+      : (OPENROUTER_MODEL_REPORT_RECOMMENDATION.includes(":free") ? OPENROUTER_MODEL_FAST : OPENROUTER_MODEL_REPORT_RECOMMENDATION);
+
     logAiRoute("/api/report/recommendations", {
-      model: OPENROUTER_MODEL_REPORT_RECOMMENDATION,
+      accessPlan: accessPlan || "free",
+      model: usedModel,
     });
 
     const result = await callOpenRouterText({
-      model: OPENROUTER_MODEL_REPORT_RECOMMENDATION,
+      model: usedModel,
       timeoutMs: 18000,
       maxTokens: 220,
       referer: req.headers.referer,
@@ -3303,7 +3800,7 @@ app.post("/api/report/recommendations", async (req, res) => {
       healthStatus: aiResult.healthStatus,
       metadata: {
         processing_mode: "report_recommendation",
-        model_used: OPENROUTER_MODEL_REPORT_RECOMMENDATION,
+        model_used: usedModel,
         ttft_ms: result.ttftMs,
         total_ms: Date.now() - started,
       },
