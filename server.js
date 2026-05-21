@@ -1,4 +1,6 @@
-require("dotenv").config();
+const path = require("path");
+
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const express = require("express");
 const cors = require("cors");
@@ -335,11 +337,20 @@ const persistSubscriptionToSupabase = async (params) => {
 
   return saved;
 };
-const SUPABASE_URL = process.env.SUPABASE_URL || "https://iygjnjkebhjwvhlmcnng.supabase.co";
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const isPlaceholderEnvValue = (value) => /\byour[-_]/i.test(String(value || ""));
+const normalizeEnvValue = (value) => {
+  const next = String(value || "").trim();
+  return next && !isPlaceholderEnvValue(next) ? next : "";
+};
+const SUPABASE_URL =
+  normalizeEnvValue(process.env.SUPABASE_URL) ||
+  normalizeEnvValue(process.env.VITE_SUPABASE_URL) ||
+  "https://iygjnjkebhjwvhlmcnng.supabase.co";
+const SUPABASE_SERVICE_ROLE_KEY = normalizeEnvValue(process.env.SUPABASE_SERVICE_ROLE_KEY);
 const SUPABASE_PUBLISHABLE_KEY =
-  process.env.SUPABASE_PUBLISHABLE_KEY ||
-  process.env.SUPABASE_ANON_KEY ||
+  normalizeEnvValue(process.env.SUPABASE_PUBLISHABLE_KEY) ||
+  normalizeEnvValue(process.env.SUPABASE_ANON_KEY) ||
+  normalizeEnvValue(process.env.VITE_SUPABASE_ANON_KEY) ||
   "sb_publishable_EtyubbYluK0jhwk7wSypGw_rDEhRRIn";
 const GOOGLE_PLAY_PACKAGE_NAME = process.env.GOOGLE_PLAY_PACKAGE_NAME || "";
 const PLAN_PRODUCT_MAP = {
