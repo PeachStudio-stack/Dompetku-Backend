@@ -387,6 +387,28 @@ const RECURRING_RULE_TABLE = "recurring_transaction_rules";
 const RECURRING_RUN_TABLE = "recurring_transaction_runs";
 const DEFAULT_TIMEZONE = "Asia/Jakarta";
 const DEFAULT_ACCOUNT_NAME = "Cash / uang tunai";
+const TRANSACTION_TOOL_PARAMETERS = {
+  type: "object",
+  properties: {
+    type: { type: "string", enum: ["income", "expense", "saving", "debt_payment", "asset"] },
+    amount: { type: "number" },
+    jumlah: { type: "number" },
+    category: { type: "string" },
+    kategori: { type: "string" },
+    description: { type: "string" },
+    catatan: { type: "string" },
+    source: { type: "string" },
+    sumber: { type: "string" },
+    method: { type: "string" },
+    metode: { type: "string" },
+    account: { type: "string" },
+    date: { type: "string" },
+    tanggal: { type: "string" },
+    classification_reason: { type: "string" },
+    confidence: { type: "number", minimum: 0, maximum: 1 },
+  },
+  required: ["type"],
+};
 const AGENT_ACTION_TOOLS = [
   {
     type: "function",
@@ -492,27 +514,18 @@ const AGENT_ACTION_TOOLS = [
     type: "function",
     function: {
       name: "addTransaction",
-      description: "Record a financial transaction.",
-      parameters: {
-        type: "object",
-        properties: {
-          type: { type: "string", enum: ["income", "expense", "saving", "debt_payment", "asset"] },
-          amount: { type: "number" },
-          jumlah: { type: "number" },
-          category: { type: "string" },
-          kategori: { type: "string" },
-          description: { type: "string" },
-          catatan: { type: "string" },
-          source: { type: "string" },
-          sumber: { type: "string" },
-          method: { type: "string" },
-          metode: { type: "string" },
-          account: { type: "string" },
-          date: { type: "string" },
-          tanggal: { type: "string" },
-        },
-        required: ["type"],
-      },
+      description:
+        "Record a financial transaction. Use type=asset for buying/adding assets or investments such as Bitcoin, crypto, stocks, gold, mutual funds, property, vehicles, or valuables; this is a cash outflow but should increase assets, not expenses.",
+      parameters: TRANSACTION_TOOL_PARAMETERS,
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "createTransaction",
+      description:
+        "Alias for addTransaction. Record a financial transaction with the same type classification rules, including type=asset for buying/adding wealth or investments.",
+      parameters: TRANSACTION_TOOL_PARAMETERS,
     },
   },
   {
@@ -777,15 +790,127 @@ Rules:
 6) Use AddAkunDompet when user asks to add/create wallet account.
 7) For income transaction, prefer fields: tanggal, jumlah, kategori, sumber, catatan.
 8) For expense transaction, prefer fields: tanggal, jumlah, kategori, metode, catatan.
-9) If amount is missing, set default amount to 17000.
-10) If date is missing, still send transaction and let app use local today's date.
-11) You may call multiple tools when needed.
-12) If user asks pure analysis/advice without mutation intent, do not call tools.
-13) For recurring requests (tiap hari/minggu/bulan pada jam tertentu), use recurring tools.
-14) Response language: ${targetLanguage}.
+9) Classify transaction type by semantic money purpose, not by memorized keywords. Ask: after this transaction, did the user receive money, consume/spend money, move money into a savings goal, pay a liability, or convert cash into wealth/asset?
+   - income: user receives money, e.g. salary, bonus, freelance, sale proceeds, dividends/profit received.
+   - expense: money is consumed as a cost, e.g. food, transport, bills, shopping, fees, admin costs, losses.
+   - saving: money moved into an app-style savings target/plan, e.g. emergency fund, vacation, house goal.
+   - debt_payment: money pays debt/installments, e.g. loan, credit card, paylater, cicilan.
+   - asset: user buys/adds wealth or an investment instrument. This includes regional language, slang, mixed English/Indonesian, and typos when the meaning is converting cash into harta/aset.
+10) Do not classify by object name alone. "beli emas" is asset, "jual emas" is income, "fee beli emas" is expense, "rugi trading" is expense. Investment purchases reduce wallet cash but increase assets/harta.
+11) Required examples:
+   - "invest bitcoin 100 ribu" => addTransaction({ type: "asset", amount: 100000, category: "Bitcoin", description: "Investasi Bitcoin" })
+   - "beli emas 1 juta" => addTransaction({ type: "asset", amount: 1000000, category: "Emas" })
+   - "dapat gaji 5 juta" => addTransaction({ type: "income", amount: 5000000, category: "Gaji" })
+   - "makan 25 ribu" => addTransaction({ type: "expense", amount: 25000, category: "Makan & Minum" })
+12) If amount is missing, set default amount to 17000.
+13) If date is missing, still send transaction and let app use local today's date.
+14) You may call multiple tools when needed.
+15) If user asks pure analysis/advice without mutation intent, do not call tools.
+16) For recurring requests (tiap hari/minggu/bulan pada jam tertentu), use recurring tools.
+17) For transaction tools, include classification_reason and confidence when possible. Keep reason short.
+18) Response language: ${targetLanguage}.
 
 Compact context:
 ${JSON.stringify(compactData)}`;
+
+const normalizePromptText = (value) =>
+  String(value || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s&\-_]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const ASSET_PURCHASE_KEYWORDS = [
+  "invest",
+  "investasi",
+  "bitcoin",
+  "btc",
+  "crypto",
+  "saham",
+  "emas",
+];
+const NON_ASSET_PURCHASE_KEYWORDS = [
+  "jual",
+  "dijual",
+  "terjual",
+  "hasil jual",
+  "profit",
+  "untung",
+  "dividen",
+  "rugi",
+  "kerugian",
+  "fee",
+  "biaya admin",
+  "admin",
+  "pajak",
+];
+
+const inferAssetCategoryFromPrompt = (prompt) => {
+  const text = normalizePromptText(prompt);
+  if (/\b(bitcoin|btc)\b/.test(text)) return "Bitcoin";
+  if (/\b(crypto|kripto)\b/.test(text)) return "Crypto";
+  if (/\bsaham\b/.test(text)) return "Saham";
+  if (/\bemas\b/.test(text)) return "Emas";
+  if (/\breksa dana\b|\breksadana\b/.test(text)) return "Reksa Dana";
+  if (/\bproperti\b/.test(text)) return "Properti";
+  if (/\bkendaraan\b/.test(text)) return "Kendaraan";
+  if (/\bbarang berharga\b/.test(text)) return "Barang Berharga";
+  return "Investasi";
+};
+
+const shouldCoerceExpenseToAsset = (prompt) => {
+  const text = normalizePromptText(prompt);
+  if (!text) return false;
+  if (NON_ASSET_PURCHASE_KEYWORDS.some((keyword) => text.includes(keyword))) return false;
+  const hasAssetKeyword = ASSET_PURCHASE_KEYWORDS.some((keyword) => text.includes(keyword));
+  const hasPurchaseIntent = /\b(beli|buy|invest|investasi|top up|topup|masuk(in)?|tambah)\b/.test(text);
+  return hasAssetKeyword && hasPurchaseIntent;
+};
+
+const applyMinimalAssetKeywordFallback = (actions, prompt) => {
+  if (!shouldCoerceExpenseToAsset(prompt)) return actions;
+  const category = inferAssetCategoryFromPrompt(prompt);
+  return (Array.isArray(actions) ? actions : []).map((action) => {
+    if (!["addTransaction", "createTransaction"].includes(String(action?.name || ""))) return action;
+    const args = { ...(action.args || {}) };
+    const txType = String(args.type || "").trim().toLowerCase();
+    if (txType !== "expense") return action;
+    const currentCategory = String(args.category || args.kategori || "").trim();
+    args.type = "asset";
+    if (!currentCategory || ["lainnya", "pengeluaran", "belanja", "investasi"].includes(currentCategory.toLowerCase())) {
+      args.category = category;
+      delete args.kategori;
+    }
+    if (!args.description && !args.catatan) {
+      args.description = `Investasi ${category}`;
+    }
+    delete args.method;
+    delete args.metode;
+    return { ...action, args };
+  });
+};
+
+const stripJsonFence = (value) =>
+  String(value || "")
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+
+const parseJsonObject = (value) => {
+  const raw = stripJsonFence(value);
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const match = raw.match(/({[\s\S]*})/);
+    if (!match) return null;
+    try {
+      return JSON.parse(match[1]);
+    } catch {
+      return null;
+    }
+  }
+};
 
 const evaluateSimpleMath = (expr) => {
   const compact = String(expr || "").replace(/\s+/g, "");
@@ -973,6 +1098,91 @@ const callOpenRouterText = async (params) => {
   const data = await response.json();
   const text = data?.choices?.[0]?.message?.content || "";
   return { text, ttftMs: Date.now() - startedAt, totalMs: Date.now() - startedAt };
+};
+
+const TRANSACTION_ACTION_NAMES = new Set(["addTransaction", "createTransaction"]);
+const TRANSACTION_TYPE_VALUES = new Set(["income", "expense", "saving", "debt_payment", "asset"]);
+const CLASSIFICATION_CONFIDENCE_THRESHOLD = 0.78;
+
+const validateTransactionClassifications = async ({ prompt, actions, model, timeoutMs, referer }) => {
+  const transactionActions = (Array.isArray(actions) ? actions : [])
+    .map((action, index) => ({ action, index }))
+    .filter(({ action }) => TRANSACTION_ACTION_NAMES.has(String(action?.name || "")));
+  if (!transactionActions.length) return actions;
+
+  try {
+    const classifierSystem = `You are a semantic transaction classifier for a personal finance app.
+Classify by money purpose, not by exact keywords or language.
+Types:
+- income: user receives money.
+- expense: money is consumed as a cost, fee, loss, bill, food, transport, shopping, etc.
+- saving: money moves into an app-style savings goal/target.
+- debt_payment: money pays a liability, loan, installment, credit card, paylater, or debt.
+- asset: user converts cash into wealth/investment/property/valuable item.
+Consider Indonesian, English, slang, typos, and regional language by meaning. Do not classify by object name alone.
+Return JSON only: {"classifications":[{"index":0,"type":"asset","category":"Bitcoin","confidence":0.92,"reason":"cash converted into investment asset"}]}.`;
+    const classifierUser = JSON.stringify({
+      prompt,
+      actions: transactionActions.map(({ action, index }) => ({
+        index,
+        name: action.name,
+        args: action.args || {},
+      })),
+    });
+    const { text } = await callOpenRouterText({
+      model,
+      timeoutMs: Math.min(Math.max(4000, Number(timeoutMs) || 8000), 8000),
+      messages: [
+        { role: "system", content: classifierSystem },
+        { role: "user", content: classifierUser },
+      ],
+      maxTokens: 600,
+      referer,
+    });
+    const parsed = parseJsonObject(text);
+    const rows = Array.isArray(parsed?.classifications) ? parsed.classifications : Array.isArray(parsed) ? parsed : [];
+    if (!rows.length) return applyMinimalAssetKeywordFallback(actions, prompt);
+
+    const byIndex = new Map();
+    for (const row of rows) {
+      const index = Number(row?.index);
+      const type = String(row?.type || "").trim().toLowerCase();
+      const confidence = Number(row?.confidence);
+      if (!Number.isInteger(index) || !TRANSACTION_TYPE_VALUES.has(type) || !Number.isFinite(confidence)) continue;
+      byIndex.set(index, {
+        type,
+        category: String(row?.category || "").trim(),
+        reason: String(row?.reason || "").trim(),
+        confidence: Math.max(0, Math.min(1, confidence)),
+      });
+    }
+
+    return actions.map((action, index) => {
+      const classification = byIndex.get(index);
+      if (!classification || classification.confidence < CLASSIFICATION_CONFIDENCE_THRESHOLD) return action;
+      if (!TRANSACTION_ACTION_NAMES.has(String(action?.name || ""))) return action;
+      const args = { ...(action.args || {}) };
+      args.type = classification.type;
+      if (classification.category) {
+        args.category = classification.category;
+        delete args.kategori;
+      }
+      if (classification.reason) args.classification_reason = classification.reason.slice(0, 160);
+      args.confidence = classification.confidence;
+      if (classification.type !== "expense") {
+        delete args.method;
+        delete args.metode;
+      }
+      if (classification.type !== "income") {
+        delete args.source;
+        delete args.sumber;
+      }
+      return { ...action, args };
+    });
+  } catch (error) {
+    console.warn("[classifier] transaction semantic check failed:", error?.message || error);
+    return applyMinimalAssetKeywordFallback(actions, prompt);
+  }
 };
 
 const callOpenRouterActions = async (params) => {
@@ -2176,6 +2386,14 @@ app.post("/api/agent/actions", async (req, res) => {
         },
       });
     }
+
+    result.actions = await validateTransactionClassifications({
+      prompt: safePrompt,
+      actions: result.actions,
+      model: usedModel,
+      timeoutMs: Math.min(primaryTimeout, secondaryTimeout),
+      referer: req.headers.referer,
+    });
 
     cleanupExpiredActionConfirmations();
     const knownCategoryMap = collectKnownCategoriesFromCurrentData(currentData || {});
