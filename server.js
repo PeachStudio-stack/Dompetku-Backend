@@ -2904,6 +2904,9 @@ app.post("/api/recurring-rules/:id/sync-timezone", requireSupabaseUser, async (r
     return res.json({ rule: updated });
   } catch (error) {
     return res.status(500).json({ error: error?.message || "Failed to sync timezone." });
+  }
+});
+
 app.post("/api/family/create", requireSupabaseUser, async (req, res) => {
   try {
     const userId = req.authUser.id;
