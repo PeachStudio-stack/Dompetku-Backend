@@ -7,6 +7,8 @@ const { rateLimit } = require("express-rate-limit");
 const { JWT } = require("google-auth-library");
 
 const app = express();
+const pendingActionConfirmations = new Map();
+const ACTION_CONFIRM_TTL_MS = 10 * 60 * 1000;
 
 const PORT = Number(process.env.PORT || 3000);
 const OPENROUTER_URL = process.env.OPENROUTER_URL || "https://openrouter.ai/api/v1/chat/completions";
@@ -163,6 +165,70 @@ const mapPromoError = (message) => {
   if (message.includes("PROMO_ALREADY_REDEEMED")) return "PROMO_ALREADY_REDEEMED";
   if (message.includes("PROMO_INVALID_REWARD")) return "PROMO_INVALID_REWARD";
   return "PROMO_REDEEM_FAILED";
+};
+
+const cleanupExpiredActionConfirmations = () => {
+  const now = Date.now();
+  for (const [id, item] of pendingActionConfirmations.entries()) {
+    if (now - Number(item?.createdAt || 0) > ACTION_CONFIRM_TTL_MS) {
+      pendingActionConfirmations.delete(id);
+    }
+  }
+};
+
+const isDeleteLikeAction = (action) => String(action?.name || "").toLowerCase().includes("delete");
+
+const buildConfirmationRequestMessage = (actions) => {
+  if (!Array.isArray(actions) || actions.length === 0) return "Konfirmasi aksi.";
+  if (actions.length === 1) return `Konfirmasi aksi hapus untuk ${actions[0].name}.`;
+  return `Konfirmasi ${actions.length} aksi hapus sekaligus.`;
+};
+
+const txTypeToCategoryType = (value) => {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw === "income") return "income";
+  if (raw === "expense") return "expense";
+  if (raw === "saving") return "saving";
+  if (raw === "debt_payment") return "debt_payment";
+  if (raw === "asset") return "asset";
+  return null;
+};
+
+const getActionCategoryType = (action) => {
+  if (!action || !action.args) return null;
+  if (["createTransaction", "addTransaction", "updateTransaction"].includes(String(action.name || ""))) {
+    return txTypeToCategoryType(action.args.type);
+  }
+  return null;
+};
+
+const getActionCategoryName = (action) => {
+  if (!action || !action.args) return "";
+  if (["createTransaction", "addTransaction", "updateTransaction"].includes(String(action.name || ""))) {
+    return normalizeCategoryName(action.args.category || action.args.kategori || "");
+  }
+  return "";
+};
+
+const collectKnownCategoriesFromCurrentData = (currentData) => {
+  const normalized = normalizeAccountingData(currentData || {});
+  const map = {
+    income: new Set(),
+    expense: new Set(),
+    saving: new Set(),
+    debt_payment: new Set(),
+    asset: new Set(),
+  };
+
+  for (const name of normalized.categories?.income || []) map.income.add(normalizeCategorySlug(name));
+  for (const name of normalized.categories?.expenses || []) map.expense.add(normalizeCategorySlug(name));
+  for (const name of normalized.categories?.assets || []) map.asset.add(normalizeCategorySlug(name));
+  for (const name of normalized.categories?.debt_payment || normalized.categories?.debts || [])
+    map.debt_payment.add(normalizeCategorySlug(name));
+  for (const name of normalized.categories?.saving || []) map.saving.add(normalizeCategorySlug(name));
+  for (const name of Object.keys(normalized.tabunganPlans || {})) map.saving.add(normalizeCategorySlug(name));
+
+  return map;
 };
 
 const ensurePromptPayload = (payload) => {
@@ -2086,6 +2152,7 @@ app.post("/api/agent/actions", async (req, res) => {
       return res.status(422).json({
         ok: false,
         actions: [],
+        confirmationRequests: [],
         assistantText: "",
         error:
           "Aksi belum terbaca jelas. Coba tulis lebih spesifik, contoh: 'Tambah tabungan mobil 500rb' atau 'Catat makan 25rb'.",
@@ -2099,10 +2166,103 @@ app.post("/api/agent/actions", async (req, res) => {
       });
     }
 
+    cleanupExpiredActionConfirmations();
+    const knownCategoryMap = collectKnownCategoriesFromCurrentData(currentData || {});
+    const directActions = [];
+    const deleteActions = [];
+    const unknownCategoryConfirmChains = [];
+    const unknownCategoryKeys = new Set();
+
+    for (const action of result.actions) {
+      if (isDeleteLikeAction(action)) {
+        deleteActions.push(action);
+        continue;
+      }
+
+      const categoryType = getActionCategoryType(action);
+      const categoryName = getActionCategoryName(action);
+      if (
+        categoryType &&
+        categoryName &&
+        categoryType !== "saving" &&
+        !knownCategoryMap[categoryType].has(normalizeCategorySlug(categoryName))
+      ) {
+        const key = `${categoryType}:${normalizeCategorySlug(categoryName)}`;
+        if (!unknownCategoryKeys.has(key)) {
+          unknownCategoryKeys.add(key);
+          unknownCategoryConfirmChains.push({
+            categoryType,
+            categoryName,
+            actions: [
+              {
+                name: "createCategory",
+                args: {
+                  category_type: categoryType,
+                  name: categoryName,
+                  source: "ai",
+                  section: categoryType === "income" ? "income" : categoryType === "expense" ? "expenses" : categoryType === "asset" ? "assets" : categoryType === "debt_payment" ? "debts" : "saving",
+                },
+              },
+              action,
+            ],
+          });
+        } else {
+          const chain = unknownCategoryConfirmChains.find(
+            (item) => item.categoryType === categoryType && normalizeCategorySlug(item.categoryName) === normalizeCategorySlug(categoryName)
+          );
+          if (chain) chain.actions.push(action);
+        }
+        continue;
+      }
+
+      directActions.push(action);
+    }
+
+    const confirmationRequests = [];
+    if (deleteActions.length) {
+      const confirmationId = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      pendingActionConfirmations.set(confirmationId, {
+        id: confirmationId,
+        createdAt: Date.now(),
+        actions: deleteActions,
+        summary: buildConfirmationRequestMessage(deleteActions),
+      });
+      confirmationRequests.push({
+        id: confirmationId,
+        title: "Konfirmasi Aksi Hapus",
+        message: buildConfirmationRequestMessage(deleteActions),
+        actions: deleteActions,
+        kind: "delete",
+      });
+    }
+
+    for (const chain of unknownCategoryConfirmChains) {
+      const confirmationId = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      const message = `Kategori "${chain.categoryName}" (${chain.categoryType}) belum ada. Konfirmasi untuk membuat kategori baru lalu lanjutkan transaksi.`;
+      pendingActionConfirmations.set(confirmationId, {
+        id: confirmationId,
+        createdAt: Date.now(),
+        actions: chain.actions,
+        summary: message,
+      });
+      confirmationRequests.push({
+        id: confirmationId,
+        title: "Konfirmasi Kategori Baru",
+        message,
+        actions: chain.actions,
+        kind: "unknown_category",
+      });
+    }
+
     return res.json({
       ok: true,
-      actions: result.actions,
-      assistantText: result.assistantText?.trim() || "Siap, perubahan data keuangan sudah saya susun.",
+      actions: directActions,
+      confirmationRequests,
+      assistantText:
+        result.assistantText?.trim() ||
+        (confirmationRequests.length
+          ? "Perintah siap. Ada aksi yang menunggu konfirmasi kamu."
+          : "Siap, perubahan data keuangan sudah saya susun."),
       metadata: {
         processing_mode: "ai_actions",
         model_used: usedModel,
@@ -2118,6 +2278,54 @@ app.post("/api/agent/actions", async (req, res) => {
       actions: [],
       assistantText: "",
       error: error?.message || "Agent action request failed.",
+    });
+  }
+});
+
+app.post("/api/agent/actions/confirm", async (req, res) => {
+  try {
+    const { confirmationId, currentData } = req.body || {};
+    const id = String(confirmationId || "").trim();
+    if (!id) {
+      return res.status(400).json({ ok: false, error: "confirmationId wajib diisi." });
+    }
+    cleanupExpiredActionConfirmations();
+    const pending = pendingActionConfirmations.get(id);
+    if (!pending) {
+      return res.status(404).json({ ok: false, error: "Konfirmasi tidak ditemukan atau kadaluarsa." });
+    }
+    pendingActionConfirmations.delete(id);
+
+    return res.json({
+      ok: true,
+      actions: Array.isArray(pending.actions) ? pending.actions : [],
+      recurringActions: Array.isArray(pending.actions) ? pending.actions : [],
+      updatedData: normalizeAccountingData(currentData || {}),
+      notices: [],
+      actionSummaries: [],
+      metrics: null,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      error: error?.message || "Gagal memproses konfirmasi aksi.",
+    });
+  }
+});
+
+app.post("/api/agent/actions/cancel", async (req, res) => {
+  try {
+    const { confirmationId } = req.body || {};
+    const id = String(confirmationId || "").trim();
+    if (!id) {
+      return res.status(400).json({ ok: false, error: "confirmationId wajib diisi." });
+    }
+    pendingActionConfirmations.delete(id);
+    return res.json({ ok: true, cancelled: true });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      error: error?.message || "Gagal membatalkan konfirmasi aksi.",
     });
   }
 });

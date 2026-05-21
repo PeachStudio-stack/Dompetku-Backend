@@ -29,10 +29,12 @@ nano .env
 Wajib isi:
 
 - `OPENROUTER_API_KEY` (valid)
+- `SUPABASE_URL`
+- `SUPABASE_PUBLISHABLE_KEY`
+- `SUPABASE_SERVICE_ROLE_KEY`
 - `OPENROUTER_MODEL_FREE=deepseek/deepseek-v4-flash:free`
 - `OPENROUTER_MODEL_REPORT_RECOMMENDATION=deepseek/deepseek-v4-flash:free`
 - `CORS_ALLOWED_ORIGINS` (domain frontend kamu + origin Capacitor: `http://localhost`, `https://localhost`, `capacitor://localhost`)
-- `` (default, aktifkan hanya untuk debug non-production)
 
 Contoh:
 
@@ -43,6 +45,9 @@ OPENROUTER_API_KEY=sk-or-v1-xxxx
 OPENROUTER_MODEL_FREE=deepseek/deepseek-v4-flash:free
 OPENROUTER_MODEL_REPORT_RECOMMENDATION=deepseek/deepseek-v4-flash:free
 OPENROUTER_MODEL_QUICK_SUGGEST=deepseek/deepseek-v4-flash:free
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_PUBLISHABLE_KEY=sb_publishable_xxx
+SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
 CORS_ALLOWED_ORIGINS=http://localhost,https://localhost,http://localhost:3000,https://localhost:3000,capacitor://localhost,https://app.domainkamu.com
 
 TRUST_PROXY=loopback
@@ -81,8 +86,12 @@ pm2 logs Dompetku-BackendOnly --lines 100
 - `POST /api/chat/stream` (SSE, kompatibel dengan frontend sekarang)
 - `POST /api/quick-suggestions`
 - `POST /api/report/recommendations`
+- `POST /api/agent/actions`
+- `POST /api/agent/actions/confirm`
+- `POST /api/agent/actions/cancel`
+- `GET /api/promocodes/public`
+- `POST /api/promocodes/redeem`
 - `POST /api/iap/google/verify`
-- `POST /api/iap/admin/activate` (debug only, admin only, non-production)
 
 ## Contoh test dari VPS
 
