@@ -1,4 +1,4 @@
-const path = require("path");
+﻿const path = require("path");
 
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 
@@ -546,6 +546,7 @@ const ACCESS_OVERRIDE_TABLE = "user_access_overrides";
 const PROMO_CODE_TABLE = "promo.codes";
 const RECURRING_RULE_TABLE = "recurring_transaction_rules";
 const RECURRING_RUN_TABLE = "recurring_transaction_runs";
+const SUBSCRIPTION_TABLE = "subscriptions";
 const DEFAULT_TIMEZONE = "Asia/Jakarta";
 const DEFAULT_ACCOUNT_NAME = "Total Keuangan";
 const TRANSACTION_TOOL_PARAMETERS = {
@@ -987,8 +988,11 @@ const resolveModelPlan = (prompt) => {
   return { intent, primary, secondary, primaryTimeout, secondaryTimeout, maxTokens };
 };
 
-const isFreeAccess = (accessPlan) =>
-  !["premium", "paid", "subscribed"].includes(String(accessPlan || "").toLowerCase());
+const isFreeAccess = (accessPlan) => {
+  const plan = String(accessPlan || "").toLowerCase().trim();
+  // "premium", "paid", "subscribed" = paid subscription; "admin" = admin override
+  return !["premium", "paid", "subscribed", "admin"].includes(plan);
+};
 
 const resolveAccessModelPlan = (prompt, accessPlan) => {
   const plan = resolveModelPlan(prompt);
@@ -1787,6 +1791,24 @@ const supabaseRestFetch = async (pathWithQuery, init = {}) => {
 };
 
 const firstRow = (value) => (Array.isArray(value) ? value[0] : value);
+
+const resolveUserAccessPlanFromDB = async (userId) => {
+  try {
+    const [overrideRows, subRows] = await Promise.all([
+      supabaseRestFetch(`${ACCESS_OVERRIDE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=role&limit=1`).catch(() => null),
+      supabaseRestFetch(`${SUBSCRIPTION_TABLE}?user_id=eq.${encodeURIComponent(userId)}&status=eq.active&select=plan,status&order=created_at.desc&limit=1`).catch(() => null),
+    ]);
+    const override = firstRow(overrideRows);
+    if (override?.role === "admin") return "admin";
+    const sub = firstRow(subRows);
+    if (sub?.status === "active") return "premium";
+    return "free";
+  } catch (err) {
+    console.warn("[resolveUserAccessPlanFromDB] failed:", err?.message);
+    return null; // null = fallback to client-provided value
+  }
+};
+
 
 const CATEGORY_TYPES = new Set(["income", "expense", "saving", "debt_payment", "asset"]);
 const normalizeCategoryType = (value) => {
@@ -2612,7 +2634,19 @@ app.post("/api/agent/actions", async (req, res) => {
   const started = Date.now();
   let safePrompt = "";
   try {
-    const { currentData, language, accessPlan } = req.body || {};
+    const { currentData, language, accessPlan: clientAccessPlan } = req.body || {};
+    // Server-side subscription verification: get userId from JWT if present
+    let accessPlan = clientAccessPlan || "free";
+    const bearerToken = getBearerTokenFromRequest(req);
+    if (bearerToken) {
+      try {
+        const authUser = await verifySupabaseUserAccessToken(bearerToken);
+        if (authUser?.id) {
+          const dbPlan = await resolveUserAccessPlanFromDB(authUser.id);
+          if (dbPlan !== null) accessPlan = dbPlan;
+        }
+      } catch (_authErr) { /* non-authed request, use client value */ }
+    }
     try {
       safePrompt = ensurePromptPayload(req.body || {});
     } catch (error) {
@@ -2949,7 +2983,19 @@ app.post("/api/chat", async (req, res) => {
   const started = Date.now();
   let prompt = "";
   try {
-    const { currentData, language, accessPlan } = req.body || {};
+    const { currentData, language, accessPlan: clientAccessPlan } = req.body || {};
+    // Server-side subscription verification
+    let accessPlan = clientAccessPlan || "free";
+    const bearerToken = getBearerTokenFromRequest(req);
+    if (bearerToken) {
+      try {
+        const authUser = await verifySupabaseUserAccessToken(bearerToken);
+        if (authUser?.id) {
+          const dbPlan = await resolveUserAccessPlanFromDB(authUser.id);
+          if (dbPlan !== null) accessPlan = dbPlan;
+        }
+      } catch (_authErr) { /* non-authed request, use client value */ }
+    }
     try {
       prompt = ensurePromptPayload(req.body || {});
     } catch (error) {
@@ -3044,7 +3090,19 @@ app.post("/api/chat/stream", async (req, res) => {
 
   let prompt = "";
   try {
-    const { currentData, language, accessPlan } = req.body || {};
+    const { currentData, language, accessPlan: clientAccessPlan } = req.body || {};
+    // Server-side subscription verification
+    let accessPlan = clientAccessPlan || "free";
+    const bearerToken = getBearerTokenFromRequest(req);
+    if (bearerToken) {
+      try {
+        const authUser = await verifySupabaseUserAccessToken(bearerToken);
+        if (authUser?.id) {
+          const dbPlan = await resolveUserAccessPlanFromDB(authUser.id);
+          if (dbPlan !== null) accessPlan = dbPlan;
+        }
+      } catch (_authErr) { /* non-authed request, use client value */ }
+    }
     try {
       prompt = ensurePromptPayload(req.body || {});
     } catch (error) {
@@ -3143,7 +3201,19 @@ app.post("/api/chat/stream", async (req, res) => {
 
 app.post("/api/quick-suggestions", async (req, res) => {
   try {
-    const { text, language, accessPlan } = req.body || {};
+    const { text, language, accessPlan: clientAccessPlan } = req.body || {};
+    // Server-side subscription verification
+    let accessPlan = clientAccessPlan || "free";
+    const bearerToken = getBearerTokenFromRequest(req);
+    if (bearerToken) {
+      try {
+        const authUser = await verifySupabaseUserAccessToken(bearerToken);
+        if (authUser?.id) {
+          const dbPlan = await resolveUserAccessPlanFromDB(authUser.id);
+          if (dbPlan !== null) accessPlan = dbPlan;
+        }
+      } catch (_authErr) { /* non-authed request */ }
+    }
     const query = String(text || "").trim();
     if (!query) return res.json({ suggestions: [] });
     if (query.length > MAX_PROMPT_CHARS) {
@@ -3154,7 +3224,7 @@ app.post("/api/quick-suggestions", async (req, res) => {
 Generate exactly 3 short quick suggestions for a personal finance assistant app.
 Rules:
 - Language: ${language || "Indonesian"}
-- Each suggestion max 10 words
+- Each suggestion must be max 40 characters
 - Practical and directly actionable
 - No numbering, no markdown, no explanation
 - Return valid JSON object only: {"suggestions":["...","...","..."]}`;
@@ -3183,7 +3253,10 @@ Rules:
     }
 
     const suggestions = Array.isArray(parsed?.suggestions)
-      ? parsed.suggestions.map((v) => String(v || "").trim()).filter(Boolean).slice(0, 3)
+      ? parsed.suggestions
+          .map((v) => String(v || "").trim().slice(0, 40))
+          .filter(Boolean)
+          .slice(0, 3)
       : [];
 
     if (!suggestions.length) throw new Error("No suggestions returned");
