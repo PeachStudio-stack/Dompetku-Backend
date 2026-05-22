@@ -2711,7 +2711,6 @@ const runRecurringSchedulerTick = async () => {
 
 app.set("trust proxy", TRUST_PROXY);
 app.use(helmet());
-app.use(express.json({ limit: "10mb" }));
 app.use(
   cors({
     origin(origin, callback) {
@@ -2720,6 +2719,41 @@ app.use(
     },
   })
 );
+app.use(express.json({ limit: "10mb" }));
+app.use((error, req, res, next) => {
+  const errorType = String(error?.type || "");
+  const isJsonSyntaxError =
+    (error instanceof SyntaxError && Object.prototype.hasOwnProperty.call(error, "body")) ||
+    errorType === "entity.parse.failed";
+  const isPayloadTooLarge = errorType === "entity.too.large";
+  if (!isJsonSyntaxError && !isPayloadTooLarge) return next(error);
+
+  const requestPath = String(req?.path || "");
+  const isConfirmPath = requestPath === "/api/agent/actions/confirm";
+  const status = isPayloadTooLarge ? 413 : 400;
+  const errorCode = isPayloadTooLarge ? "request_body_too_large" : "request_json_invalid";
+  const errorDomain = isConfirmPath ? "confirm_error" : "request_parse_error";
+  const userMessage = isPayloadTooLarge
+    ? "Payload request terlalu besar. Coba kirim ulang data yang lebih ringkas."
+    : "Format JSON request tidak valid. Silakan coba lagi.";
+
+  console.warn(
+    "[request-json-error]",
+    JSON.stringify({
+      route: requestPath,
+      status: "failed",
+      error_code: errorCode,
+      error_domain: errorDomain,
+      detail: String(error?.message || "").slice(0, 160),
+    })
+  );
+  return res.status(status).json({
+    ok: false,
+    error: userMessage,
+    error_code: errorCode,
+    error_domain: errorDomain,
+  });
+});
 
 const makeLimiter = (max, scope) =>
   rateLimit({
@@ -3751,6 +3785,8 @@ app.post("/api/agent/actions", async (req, res) => {
         assistantText: "",
         error: getAiUserFacingMessage(error),
         error_code: errorCode,
+        error_domain: "ai_provider_error",
+        error_phase: "agent_actions_generation",
       });
     }
     console.error("Agent Actions Error:", error);
@@ -3760,23 +3796,35 @@ app.post("/api/agent/actions", async (req, res) => {
       assistantText: "",
       error: error?.message || "Agent action request failed.",
       error_code: "unknown",
+      error_domain: "agent_actions_error",
+      error_phase: "agent_actions_generation",
     });
   }
 });
 
 app.post("/api/agent/actions/confirm", async (req, res) => {
   try {
-    const { confirmationId, currentData } = req.body || {};
+    const { confirmationId } = req.body || {};
     const id = String(confirmationId || "").trim();
     if (!id) {
       console.warn("[confirm-pipeline]", JSON.stringify({ status: "confirmed_failed", confirmation_id: id || null, error_code: "missing_confirmation_id" }));
-      return res.status(400).json({ ok: false, error: "confirmationId wajib diisi." });
+      return res.status(400).json({
+        ok: false,
+        error: "confirmationId wajib diisi.",
+        error_code: "missing_confirmation_id",
+        error_domain: "confirm_error",
+      });
     }
     cleanupExpiredActionConfirmations();
     const pending = pendingActionConfirmations.get(id);
     if (!pending) {
       console.warn("[confirm-pipeline]", JSON.stringify({ status: "confirmed_failed", confirmation_id: id, error_code: "confirmation_not_found" }));
-      return res.status(404).json({ ok: false, error: "Konfirmasi tidak ditemukan atau kadaluarsa." });
+      return res.status(404).json({
+        ok: false,
+        error: "Konfirmasi tidak ditemukan atau kadaluarsa.",
+        error_code: "confirmation_not_found",
+        error_domain: "confirm_error",
+      });
     }
     pendingActionConfirmations.delete(id);
     console.log(
@@ -3792,24 +3840,27 @@ app.post("/api/agent/actions/confirm", async (req, res) => {
       ok: true,
       actions: Array.isArray(pending.actions) ? pending.actions : [],
       recurringActions: Array.isArray(pending.actions) ? pending.actions : [],
-      updatedData: normalizeAccountingData(currentData || {}),
+      updatedData: null,
       notices: [],
       actionSummaries: [],
       metrics: null,
+      metadata: {
+        confirmation_id: id,
+        status: "confirmed_applied",
+        uses_client_local_data: true,
+      },
     });
   } catch (error) {
-    console.warn(
-      "[confirm-pipeline]",
-      JSON.stringify({
-        status: "confirmed_failed",
-        confirmation_id: String(req.body?.confirmationId || "").trim() || null,
-        error_code: getAiErrorCode(error),
-      })
-    );
+    const confirmationId = String(req.body?.confirmationId || "").trim() || null;
+    const aiCode = getAiErrorCode(error);
+    const errorCode = aiCode && aiCode !== "unknown" ? aiCode : "confirm_processing_failed";
+    const errorDomain = aiCode && aiCode !== "unknown" ? "ai_provider_error" : "confirm_error";
+    console.warn("[confirm-pipeline]", JSON.stringify({ status: "confirmed_failed", confirmation_id: confirmationId, error_code: errorCode }));
     return res.status(500).json({
       ok: false,
       error: error?.message || "Gagal memproses konfirmasi aksi.",
-      error_code: getAiErrorCode(error),
+      error_code: errorCode,
+      error_domain: errorDomain,
     });
   }
 });
