@@ -1330,6 +1330,41 @@ const isOpenRouterRateLimitError = (error) => {
 const getOpenRouterRateLimitMessage = () =>
   "Layanan AI sedang padat (rate limit). Coba lagi beberapa saat lagi.";
 
+const createAiError = (code, message, extras = {}) => {
+  const err = new Error(message);
+  err.code = code;
+  for (const [key, value] of Object.entries(extras || {})) {
+    err[key] = value;
+  }
+  return err;
+};
+
+const isProviderMalformedJsonError = (error) => String(error?.code || "") === "provider_malformed_json";
+const isProviderTimeoutError = (error) =>
+  String(error?.code || "") === "provider_timeout" || String(error?.name || "") === "AbortError";
+const isRetriableAiError = (error) =>
+  isOpenRouterRateLimitError(error) || isProviderMalformedJsonError(error) || isProviderTimeoutError(error);
+
+const getAiErrorCode = (error) => {
+  if (isProviderMalformedJsonError(error)) return "provider_malformed_json";
+  if (isProviderTimeoutError(error)) return "provider_timeout";
+  if (isOpenRouterRateLimitError(error)) return "rate_limited";
+  return "unknown";
+};
+
+const getAiUserFacingMessage = (error) => {
+  if (isProviderMalformedJsonError(error)) {
+    return "Respons AI belum utuh. Coba lagi sebentar.";
+  }
+  if (isProviderTimeoutError(error)) {
+    return "Proses AI timeout. Coba lagi sebentar.";
+  }
+  if (isOpenRouterRateLimitError(error)) {
+    return getOpenRouterRateLimitMessage();
+  }
+  return String(error?.message || "Layanan AI sedang bermasalah. Coba lagi.");
+};
+
 const normalizeHealthStatus = (value) => {
   const raw = String(value || "").trim().toLowerCase();
   if (!raw) return null;
@@ -1610,23 +1645,34 @@ const openRouterFetch = async ({ model, timeoutMs, messages, maxTokens, stream, 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(OPENROUTER_URL, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": referer || "http://localhost:3000",
-        "X-Title": "Dompetku BackendOnly",
-      },
-      body: JSON.stringify({
-        model,
-        temperature: 0.15,
-        max_tokens: maxTokens,
-        stream: Boolean(stream),
-        messages,
-      }),
-    });
+    let response;
+    try {
+      response = await fetch(OPENROUTER_URL, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": referer || "http://localhost:3000",
+          "X-Title": "Dompetku BackendOnly",
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.15,
+          max_tokens: maxTokens,
+          stream: Boolean(stream),
+          messages,
+        }),
+      });
+    } catch (error) {
+      if (String(error?.name || "") === "AbortError") {
+        throw createAiError("provider_timeout", `OpenRouter timeout after ${timeoutMs}ms`, {
+          model,
+          timeout_ms: timeoutMs,
+        });
+      }
+      throw error;
+    }
 
     if (!response.ok) {
       const err = await response.text();
@@ -1639,10 +1685,27 @@ const openRouterFetch = async ({ model, timeoutMs, messages, maxTokens, stream, 
   }
 };
 
+const parseProviderJsonOrThrow = ({ rawText, context, model }) => {
+  try {
+    return JSON.parse(String(rawText || ""));
+  } catch (error) {
+    throw createAiError("provider_malformed_json", `Malformed JSON from provider in ${context}`, {
+      model,
+      raw_sample: String(rawText || "").slice(0, 300),
+      parse_error: String(error?.message || error),
+    });
+  }
+};
+
 const callOpenRouterText = async (params) => {
   const startedAt = Date.now();
   const response = await openRouterFetch({ ...params, stream: false });
-  const data = await response.json();
+  const raw = await response.text();
+  const data = parseProviderJsonOrThrow({
+    rawText: raw,
+    context: "callOpenRouterText",
+    model: params.model,
+  });
   const text = data?.choices?.[0]?.message?.content || "";
   return { text, ttftMs: Date.now() - startedAt, totalMs: Date.now() - startedAt };
 };
@@ -1759,7 +1822,12 @@ const callOpenRouterActions = async (params) => {
       const err = await response.text();
       throw new Error(`OpenRouter Error ${response.status}: ${err}`);
     }
-    const data = await response.json();
+    const raw = await response.text();
+    const data = parseProviderJsonOrThrow({
+      rawText: raw,
+      context: "callOpenRouterActions",
+      model: params.model,
+    });
     const message = data?.choices?.[0]?.message || {};
     const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
     const actions = toolCalls
@@ -3463,6 +3531,7 @@ app.post("/api/agent/actions", async (req, res) => {
     let retryForced = false;
     let result = { actions: [], assistantText: "" };
     let lastRouteError = null;
+    const modelAttempts = [];
     for (let idx = 0; idx < modelPolicy.modelFallbackChain.length; idx += 1) {
       const candidateModel = modelPolicy.modelFallbackChain[idx];
       const candidateTimeout = idx === 0 ? modelPolicy.primaryTimeout : modelPolicy.secondaryTimeout;
@@ -3490,15 +3559,24 @@ app.post("/api/agent/actions", async (req, res) => {
           usedModel = candidateModel;
           fallbackUsed = idx > 0;
           result = candidateResult;
+          modelAttempts.push({ model: candidateModel, ok: true, phase: "actions" });
           break;
         }
 
         usedModel = candidateModel;
         fallbackUsed = idx > 0;
+        modelAttempts.push({ model: candidateModel, ok: false, reason: "no_actions" });
       } catch (candidateError) {
         lastRouteError = candidateError;
         usedModel = candidateModel;
         fallbackUsed = idx > 0;
+        modelAttempts.push({
+          model: candidateModel,
+          ok: false,
+          reason: getAiErrorCode(candidateError),
+          retriable: isRetriableAiError(candidateError),
+        });
+        if (!isRetriableAiError(candidateError)) break;
       }
     }
 
@@ -3517,6 +3595,7 @@ app.post("/api/agent/actions", async (req, res) => {
           model_used: usedModel,
           fallback_used: fallbackUsed,
           retry_forced_tool_choice: retryForced,
+          model_attempts: modelAttempts,
           total_ms: Date.now() - started,
         },
       });
@@ -3652,19 +3731,26 @@ app.post("/api/agent/actions", async (req, res) => {
         plan_tier: modelPolicy.planTier,
         final_model_used: usedModel,
         fallback_used: fallbackUsed,
+        model_attempts: modelAttempts,
         retry_forced_tool_choice: retryForced,
         dropped_actions: droppedCount,
         total_ms: Date.now() - started,
       },
     });
   } catch (error) {
-    if (isOpenRouterRateLimitError(error)) {
-      console.warn("Agent Actions Rate Limited:", error?.message || error);
-      return res.status(429).json({
+    const errorCode = getAiErrorCode(error);
+    if (errorCode !== "unknown") {
+      const status = errorCode === "rate_limited" ? 429 : 503;
+      console.warn("Agent Actions AI Error:", {
+        error_code: errorCode,
+        message: error?.message || error,
+      });
+      return res.status(status).json({
         ok: false,
         actions: [],
         assistantText: "",
-        error: getOpenRouterRateLimitMessage(),
+        error: getAiUserFacingMessage(error),
+        error_code: errorCode,
       });
     }
     console.error("Agent Actions Error:", error);
@@ -3673,6 +3759,7 @@ app.post("/api/agent/actions", async (req, res) => {
       actions: [],
       assistantText: "",
       error: error?.message || "Agent action request failed.",
+      error_code: "unknown",
     });
   }
 });
@@ -3682,14 +3769,24 @@ app.post("/api/agent/actions/confirm", async (req, res) => {
     const { confirmationId, currentData } = req.body || {};
     const id = String(confirmationId || "").trim();
     if (!id) {
+      console.warn("[confirm-pipeline]", JSON.stringify({ status: "confirmed_failed", confirmation_id: id || null, error_code: "missing_confirmation_id" }));
       return res.status(400).json({ ok: false, error: "confirmationId wajib diisi." });
     }
     cleanupExpiredActionConfirmations();
     const pending = pendingActionConfirmations.get(id);
     if (!pending) {
+      console.warn("[confirm-pipeline]", JSON.stringify({ status: "confirmed_failed", confirmation_id: id, error_code: "confirmation_not_found" }));
       return res.status(404).json({ ok: false, error: "Konfirmasi tidak ditemukan atau kadaluarsa." });
     }
     pendingActionConfirmations.delete(id);
+    console.log(
+      "[confirm-pipeline]",
+      JSON.stringify({
+        status: "confirmed_applied",
+        confirmation_id: id,
+        action_count: Array.isArray(pending.actions) ? pending.actions.length : 0,
+      })
+    );
 
     return res.json({
       ok: true,
@@ -3701,9 +3798,18 @@ app.post("/api/agent/actions/confirm", async (req, res) => {
       metrics: null,
     });
   } catch (error) {
+    console.warn(
+      "[confirm-pipeline]",
+      JSON.stringify({
+        status: "confirmed_failed",
+        confirmation_id: String(req.body?.confirmationId || "").trim() || null,
+        error_code: getAiErrorCode(error),
+      })
+    );
     return res.status(500).json({
       ok: false,
       error: error?.message || "Gagal memproses konfirmasi aksi.",
+      error_code: getAiErrorCode(error),
     });
   }
 });
@@ -3839,6 +3945,7 @@ app.post("/api/chat", async (req, res) => {
     let aiText = "";
     let timing = { ttftMs: 0, totalMs: 0 };
     let lastRouteError = null;
+    const modelAttempts = [];
     for (let idx = 0; idx < modelPolicy.modelFallbackChain.length; idx += 1) {
       const candidateModel = modelPolicy.modelFallbackChain[idx];
       const candidateTimeout = idx === 0 ? modelPolicy.primaryTimeout : modelPolicy.secondaryTimeout;
@@ -3855,12 +3962,20 @@ app.post("/api/chat", async (req, res) => {
         fallbackUsed = idx > 0;
         aiText = result.text;
         timing = { ttftMs: result.ttftMs, totalMs: result.totalMs };
+        modelAttempts.push({ model: candidateModel, ok: true });
         if (idx > 0) {
           console.warn("Primary model failed, fallback used:", String(lastRouteError || ""));
         }
         break;
       } catch (candidateError) {
         lastRouteError = candidateError;
+        modelAttempts.push({
+          model: candidateModel,
+          ok: false,
+          reason: getAiErrorCode(candidateError),
+          retriable: isRetriableAiError(candidateError),
+        });
+        if (!isRetriableAiError(candidateError)) break;
       }
     }
     if (!aiText && lastRouteError) throw lastRouteError;
@@ -3890,11 +4005,19 @@ app.post("/api/chat", async (req, res) => {
         plan_tier: modelPolicy.planTier,
         final_model_used: usedModel,
         fallback_used: fallbackUsed,
+        model_attempts: modelAttempts,
         ttft_ms: timing.ttftMs,
         total_ms: Date.now() - started,
       },
     });
   } catch (error) {
+    if (getAiErrorCode(error) !== "unknown") {
+      const status = getAiErrorCode(error) === "rate_limited" ? 429 : 503;
+      return res.status(status).json({
+        error: getAiUserFacingMessage(error),
+        error_code: getAiErrorCode(error),
+      });
+    }
     console.error("AI Proxy Error:", error);
     res.status(500).json({ error: error?.message || "Unknown error" });
   }
@@ -3963,6 +4086,7 @@ app.post("/api/chat/stream", async (req, res) => {
     let fullText = "";
     let hasEmittedToken = false;
     let ttftMs = 0;
+    const modelAttempts = [];
 
     const runStream = async (model, timeoutMs, tokenBudget) => {
       const streamResult = await streamOpenRouterText({
@@ -3989,6 +4113,7 @@ app.post("/api/chat/stream", async (req, res) => {
         usedModel = candidateModel;
         fallbackUsed = idx > 0;
         await runStream(candidateModel, candidateTimeout, candidateMaxTokens);
+        modelAttempts.push({ model: candidateModel, ok: true });
         if (idx > 0) {
           console.warn("Primary stream failed, fallback used:", String(lastRouteError || ""));
         }
@@ -3996,6 +4121,13 @@ app.post("/api/chat/stream", async (req, res) => {
       } catch (candidateError) {
         if (hasEmittedToken) throw candidateError;
         lastRouteError = candidateError;
+        modelAttempts.push({
+          model: candidateModel,
+          ok: false,
+          reason: getAiErrorCode(candidateError),
+          retriable: isRetriableAiError(candidateError),
+        });
+        if (!isRetriableAiError(candidateError)) break;
       }
     }
     if (!fullText && lastRouteError) throw lastRouteError;
@@ -4026,12 +4158,18 @@ app.post("/api/chat/stream", async (req, res) => {
         plan_tier: modelPolicy.planTier,
         final_model_used: usedModel,
         fallback_used: fallbackUsed,
+        model_attempts: modelAttempts,
         ttft_ms: ttftMs,
         total_ms: Date.now() - started,
       },
     });
     res.end();
   } catch (error) {
+    if (getAiErrorCode(error) !== "unknown") {
+      sendEvent("error", { message: getAiUserFacingMessage(error), error_code: getAiErrorCode(error) });
+      res.end();
+      return;
+    }
     console.error("AI Stream Error:", error);
     sendEvent("error", { message: error?.message || "Streaming failed" });
     res.end();
@@ -4085,6 +4223,7 @@ Rules:
 
     let result = null;
     let lastRouteError = null;
+    const modelAttempts = [];
     for (let idx = 0; idx < modelPolicy.modelFallbackChain.length; idx += 1) {
       const candidateModel = modelPolicy.modelFallbackChain[idx];
       try {
@@ -4097,9 +4236,17 @@ Rules:
         });
         usedModel = candidateModel;
         fallbackUsed = idx > 0;
+        modelAttempts.push({ model: candidateModel, ok: true });
         break;
       } catch (candidateError) {
         lastRouteError = candidateError;
+        modelAttempts.push({
+          model: candidateModel,
+          ok: false,
+          reason: getAiErrorCode(candidateError),
+          retriable: isRetriableAiError(candidateError),
+        });
+        if (!isRetriableAiError(candidateError)) break;
       }
     }
     if (!result && lastRouteError) throw lastRouteError;
@@ -4130,11 +4277,13 @@ Rules:
         plan_tier: modelPolicy.planTier,
         final_model_used: usedModel,
         fallback_used: fallbackUsed,
+        model_attempts: modelAttempts,
       },
     });
   } catch (error) {
-    if (isOpenRouterRateLimitError(error)) {
-      return res.status(429).json({ error: getOpenRouterRateLimitMessage() });
+    if (getAiErrorCode(error) !== "unknown") {
+      const status = getAiErrorCode(error) === "rate_limited" ? 429 : 503;
+      return res.status(status).json({ error: getAiUserFacingMessage(error), error_code: getAiErrorCode(error) });
     }
     return res.status(503).json({ error: error?.message || "Quick suggestions unavailable" });
   }
@@ -4180,6 +4329,7 @@ app.post("/api/report/recommendations", async (req, res) => {
 
     let result = null;
     let lastRouteError = null;
+    const modelAttempts = [];
     for (let idx = 0; idx < modelPolicy.modelFallbackChain.length; idx += 1) {
       const candidateModel = modelPolicy.modelFallbackChain[idx];
       try {
@@ -4197,9 +4347,17 @@ app.post("/api/report/recommendations", async (req, res) => {
         });
         usedModel = candidateModel;
         fallbackUsed = idx > 0;
+        modelAttempts.push({ model: candidateModel, ok: true });
         break;
       } catch (candidateError) {
         lastRouteError = candidateError;
+        modelAttempts.push({
+          model: candidateModel,
+          ok: false,
+          reason: getAiErrorCode(candidateError),
+          retriable: isRetriableAiError(candidateError),
+        });
+        if (!isRetriableAiError(candidateError)) break;
       }
     }
     if (!result && lastRouteError) throw lastRouteError;
@@ -4221,14 +4379,18 @@ app.post("/api/report/recommendations", async (req, res) => {
         plan_tier: modelPolicy.planTier,
         final_model_used: usedModel,
         fallback_used: fallbackUsed,
+        model_attempts: modelAttempts,
         ttft_ms: result?.ttftMs,
         total_ms: Date.now() - started,
       },
     });
   } catch (error) {
-    if (isOpenRouterRateLimitError(error)) {
-      console.warn("Report Recommendation Rate Limited:", error?.message || error);
-      return res.status(429).json({ error: getOpenRouterRateLimitMessage() });
+    if (getAiErrorCode(error) !== "unknown") {
+      const status = getAiErrorCode(error) === "rate_limited" ? 429 : 503;
+      return res.status(status).json({
+        error: getAiUserFacingMessage(error),
+        error_code: getAiErrorCode(error),
+      });
     }
     console.error("Report Recommendation Error:", error);
     return res.status(503).json({ error: error?.message || "Report recommendations unavailable" });
