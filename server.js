@@ -1020,6 +1020,89 @@ const classifyIntent = (prompt) => {
   return heavyHints.some((hint) => text.includes(hint)) ? "analysis" : "simple";
 };
 
+const DEFAULT_PAID_FAST_MODEL = "deepseek/deepseek-v4-flash";
+const DEFAULT_PAID_HEAVY_MODEL = "deepseek/deepseek-v4-flash";
+const DEFAULT_FREE_MODEL = "deepseek/deepseek-v4-flash:free";
+const warnedModelConfigLabels = new Set();
+
+const isFreeModelId = (model) => String(model || "").includes(":free");
+
+const sanitizeModelId = (model, fallback) => {
+  const raw = String(model || "").trim();
+  return raw || fallback;
+};
+
+const sanitizePaidModelId = (model, fallback, label) => {
+  const safe = sanitizeModelId(model, fallback);
+  if (isFreeModelId(safe)) {
+    if (!warnedModelConfigLabels.has(label)) {
+      warnedModelConfigLabels.add(label);
+      console.warn(`[ai-model] ${label} is configured as free (${safe}). Using paid fallback (${fallback}).`);
+    }
+    return fallback;
+  }
+  return safe;
+};
+
+const uniqueModelChain = (models) => {
+  const out = [];
+  const seen = new Set();
+  for (const item of Array.isArray(models) ? models : []) {
+    const model = String(item || "").trim();
+    if (!model || seen.has(model)) continue;
+    seen.add(model);
+    out.push(model);
+  }
+  return out;
+};
+
+const resolveAiRouteModelPolicy = ({ route, prompt, accessPlan }) => {
+  const base = resolveModelPlan(prompt || "");
+  const planTier = isFreeAccess(accessPlan) ? "free" : "paid";
+  const freeModel = sanitizeModelId(OPENROUTER_MODEL_FREE, DEFAULT_FREE_MODEL);
+
+  if (planTier === "free") {
+    return {
+      planTier,
+      intent: base.intent,
+      primaryModel: freeModel,
+      fallbackModels: [],
+      modelFallbackChain: [freeModel],
+      primaryTimeout: OPENROUTER_TIMEOUT_FAST_MS,
+      secondaryTimeout: OPENROUTER_TIMEOUT_FAST_MS,
+      maxTokens: base.maxTokens,
+    };
+  }
+
+  const fastModel = sanitizePaidModelId(OPENROUTER_MODEL_FAST, DEFAULT_PAID_FAST_MODEL, "OPENROUTER_MODEL_FAST");
+  const heavyModel = sanitizePaidModelId(OPENROUTER_MODEL_HEAVY, DEFAULT_PAID_HEAVY_MODEL, "OPENROUTER_MODEL_HEAVY");
+
+  let primaryModel = base.intent === "simple" ? fastModel : heavyModel;
+  let paidFallbackModel = base.intent === "simple" ? heavyModel : fastModel;
+
+  if (route === "quick_suggestions") {
+    primaryModel = fastModel;
+    paidFallbackModel = heavyModel;
+  }
+  if (route === "report_recommendations") {
+    primaryModel = heavyModel;
+    paidFallbackModel = fastModel;
+  }
+
+  const modelFallbackChain = uniqueModelChain([primaryModel, paidFallbackModel, freeModel]);
+
+  return {
+    planTier,
+    intent: base.intent,
+    primaryModel: modelFallbackChain[0],
+    fallbackModels: modelFallbackChain.slice(1),
+    modelFallbackChain,
+    primaryTimeout: base.primaryTimeout,
+    secondaryTimeout: base.secondaryTimeout,
+    maxTokens: base.maxTokens,
+  };
+};
+
 const resolveModelPlan = (prompt) => {
   const intent = classifyIntent(prompt);
   const primary = intent === "simple" ? OPENROUTER_MODEL_FAST : OPENROUTER_MODEL_HEAVY;
@@ -1038,16 +1121,20 @@ const isFreeAccess = (accessPlan) => {
 };
 
 const resolveAccessModelPlan = (prompt, accessPlan) => {
-  const plan = resolveModelPlan(prompt);
-  if (!isFreeAccess(accessPlan)) return plan;
+  const policy = resolveAiRouteModelPolicy({ route: "chat", prompt, accessPlan });
   return {
-    ...plan,
-    primary: OPENROUTER_MODEL_FREE,
-    secondary: OPENROUTER_MODEL_FREE,
-    primaryTimeout: OPENROUTER_TIMEOUT_FAST_MS,
-    secondaryTimeout: OPENROUTER_TIMEOUT_FAST_MS,
+    intent: policy.intent,
+    primary: policy.primaryModel,
+    secondary: policy.fallbackModels[0] || policy.primaryModel,
+    primaryTimeout: policy.primaryTimeout,
+    secondaryTimeout: policy.secondaryTimeout,
+    maxTokens: policy.maxTokens,
   };
 };
+
+// Startup guard rails for paid model configuration.
+sanitizePaidModelId(OPENROUTER_MODEL_FAST, DEFAULT_PAID_FAST_MODEL, "OPENROUTER_MODEL_FAST");
+sanitizePaidModelId(OPENROUTER_MODEL_HEAVY, DEFAULT_PAID_HEAVY_MODEL, "OPENROUTER_MODEL_HEAVY");
 
 const compactObject = (obj = {}) =>
   Object.fromEntries(Object.entries(obj).filter(([, value]) => Number(value) !== 0));
@@ -1233,6 +1320,115 @@ const parseJsonObject = (value) => {
       return null;
     }
   }
+};
+
+const isOpenRouterRateLimitError = (error) => {
+  const message = String(error?.message || "");
+  return message.includes("OpenRouter Error 429") || message.includes('"code":429');
+};
+
+const getOpenRouterRateLimitMessage = () =>
+  "Layanan AI sedang padat (rate limit). Coba lagi beberapa saat lagi.";
+
+const normalizeHealthStatus = (value) => {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return null;
+  if (["aman", "safe", "good", "healthy"].includes(raw)) return "aman";
+  if (["perhatian", "warning", "caution", "watch"].includes(raw)) return "perhatian";
+  if (["bahaya", "danger", "critical", "risk"].includes(raw)) return "bahaya";
+  return null;
+};
+
+const clampHealthScore = (value) => {
+  const score = Number(value);
+  if (!Number.isFinite(score)) return null;
+  return Math.max(0, Math.min(100, Math.round(score)));
+};
+
+const parseReportAiResult = (rawText) => {
+  const parsed = parseJsonObject(rawText);
+  const source = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  const fallbackArray = Array.isArray(parsed) ? parsed : [];
+
+  const healthScore =
+    clampHealthScore(source.healthScore) ??
+    clampHealthScore(source.health_score) ??
+    clampHealthScore(source.score);
+  const healthStatus =
+    normalizeHealthStatus(source.healthStatus) ??
+    normalizeHealthStatus(source.health_status) ??
+    (healthScore === null ? null : healthScore >= 75 ? "aman" : healthScore >= 50 ? "perhatian" : "bahaya");
+
+  let recommendations = [];
+  if (Array.isArray(source.recommendations)) {
+    recommendations = source.recommendations;
+  } else if (Array.isArray(source.suggestions)) {
+    recommendations = source.suggestions;
+  } else if (fallbackArray.length) {
+    recommendations = fallbackArray;
+  } else {
+    recommendations = String(rawText || "")
+      .split(/\r?\n/)
+      .map((line) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "").trim())
+      .filter(Boolean);
+  }
+
+  const cleanRecommendations = recommendations
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .slice(0, 3);
+
+  return {
+    recommendations: cleanRecommendations,
+    healthScore,
+    healthStatus,
+  };
+};
+
+const buildReportRecommendationPrompt = (targetLanguage, currentData) => {
+  const summary = JSON.stringify(
+    {
+      monthlySummary: currentData?.monthlySummary || {},
+      income: currentData?.income || {},
+      expenses: currentData?.expenses || {},
+      savings: currentData?.savings || {},
+      debts: currentData?.debts || {},
+      assets: currentData?.assets || {},
+      budgets: currentData?.budgets || {},
+      recentTransactions: Array.isArray(currentData?.transactions)
+        ? currentData.transactions.slice(-20).map((tx) => ({
+            date: tx?.date,
+            amount: tx?.amount,
+            type: tx?.type,
+            category: tx?.category,
+            account: tx?.account,
+          }))
+        : [],
+    },
+    null,
+    2
+  );
+
+  return `Anda adalah analis keuangan pribadi untuk aplikasi Dompetku.
+Tugas:
+1) Berikan 3 rekomendasi paling berdampak dan praktis berdasarkan data user.
+2) Prediksi health score 0-100 dan status: aman | perhatian | bahaya.
+Bahasa output wajib: ${targetLanguage || "Indonesian"}.
+
+Format output wajib JSON valid tanpa markdown:
+{
+  "healthScore": 0,
+  "healthStatus": "aman",
+  "recommendations": ["...", "...", "..."]
+}
+
+Rules:
+- recommendations maksimal 3 item.
+- tiap item singkat, jelas, bisa langsung dilakukan.
+- jangan menambah teks di luar JSON.
+
+Data user:
+${summary}`;
 };
 
 const evaluateSimpleMath = (expr) => {
@@ -3240,12 +3436,18 @@ app.post("/api/agent/actions", async (req, res) => {
     }
 
     const targetLanguage = String(language || "Indonesian");
-    const { primary, secondary, primaryTimeout, secondaryTimeout } =
-      resolveAccessModelPlan(safePrompt, accessPlan);
+    const modelPolicy = resolveAiRouteModelPolicy({
+      route: "agent_actions",
+      prompt: safePrompt,
+      accessPlan,
+    });
     logAiRoute("/api/agent/actions", {
       accessPlan: accessPlan || "free",
       inputChars: safePrompt.length,
-      model: primary,
+      plan_tier: modelPolicy.planTier,
+      model: modelPolicy.primaryModel,
+      model_primary: modelPolicy.primaryModel,
+      model_fallback_chain: modelPolicy.fallbackModels,
     });
     const compactData = buildCompactData(currentData || {});
     const actionSystem = buildActionSystemInstruction(targetLanguage, compactData);
@@ -3256,39 +3458,51 @@ app.post("/api/agent/actions", async (req, res) => {
       req.body.replyTo
     );
 
-    let usedModel = primary;
+    let usedModel = modelPolicy.primaryModel;
     let fallbackUsed = false;
     let retryForced = false;
-    let result = await callOpenRouterActions({
-      model: primary,
-      timeoutMs: primaryTimeout,
-      messages,
-      referer: req.headers.referer,
-      toolChoice: "auto",
-    });
+    let result = { actions: [], assistantText: "" };
+    let lastRouteError = null;
+    for (let idx = 0; idx < modelPolicy.modelFallbackChain.length; idx += 1) {
+      const candidateModel = modelPolicy.modelFallbackChain[idx];
+      const candidateTimeout = idx === 0 ? modelPolicy.primaryTimeout : modelPolicy.secondaryTimeout;
+      try {
+        let candidateResult = await callOpenRouterActions({
+          model: candidateModel,
+          timeoutMs: candidateTimeout,
+          messages,
+          referer: req.headers.referer,
+          toolChoice: "auto",
+        });
 
-    if (!result.actions.length) {
-      retryForced = true;
-      result = await callOpenRouterActions({
-        model: primary,
-        timeoutMs: primaryTimeout,
-        messages,
-        referer: req.headers.referer,
-        toolChoice: "required",
-      });
+        if (!candidateResult.actions.length) {
+          retryForced = true;
+          candidateResult = await callOpenRouterActions({
+            model: candidateModel,
+            timeoutMs: candidateTimeout,
+            messages,
+            referer: req.headers.referer,
+            toolChoice: "required",
+          });
+        }
+
+        if (candidateResult.actions.length) {
+          usedModel = candidateModel;
+          fallbackUsed = idx > 0;
+          result = candidateResult;
+          break;
+        }
+
+        usedModel = candidateModel;
+        fallbackUsed = idx > 0;
+      } catch (candidateError) {
+        lastRouteError = candidateError;
+        usedModel = candidateModel;
+        fallbackUsed = idx > 0;
+      }
     }
 
-    if (!result.actions.length) {
-      fallbackUsed = true;
-      usedModel = secondary;
-      result = await callOpenRouterActions({
-        model: secondary,
-        timeoutMs: secondaryTimeout,
-        messages,
-        referer: req.headers.referer,
-        toolChoice: "required",
-      });
-    }
+    if (!result.actions.length && lastRouteError) throw lastRouteError;
 
     if (!result.actions.length) {
       return res.status(422).json({
@@ -3312,7 +3526,7 @@ app.post("/api/agent/actions", async (req, res) => {
       prompt: safePrompt,
       actions: result.actions,
       model: usedModel,
-      timeoutMs: Math.min(primaryTimeout, secondaryTimeout),
+      timeoutMs: Math.min(modelPolicy.primaryTimeout, modelPolicy.secondaryTimeout),
       referer: req.headers.referer,
     });
 
@@ -3433,6 +3647,10 @@ app.post("/api/agent/actions", async (req, res) => {
       metadata: {
         processing_mode: "ai_actions",
         model_used: usedModel,
+        model_primary: modelPolicy.primaryModel,
+        model_fallback_chain: modelPolicy.fallbackModels,
+        plan_tier: modelPolicy.planTier,
+        final_model_used: usedModel,
         fallback_used: fallbackUsed,
         retry_forced_tool_choice: retryForced,
         dropped_actions: droppedCount,
@@ -3440,6 +3658,15 @@ app.post("/api/agent/actions", async (req, res) => {
       },
     });
   } catch (error) {
+    if (isOpenRouterRateLimitError(error)) {
+      console.warn("Agent Actions Rate Limited:", error?.message || error);
+      return res.status(429).json({
+        ok: false,
+        actions: [],
+        assistantText: "",
+        error: getOpenRouterRateLimitMessage(),
+      });
+    }
     console.error("Agent Actions Error:", error);
     return res.status(500).json({
       ok: false,
@@ -3583,14 +3810,20 @@ app.post("/api/chat", async (req, res) => {
       return res.status(400).json({ error: error?.message || "Payload tidak valid." });
     }
     const targetLanguage = language || "Indonesian";
-    const { primary, secondary, primaryTimeout, secondaryTimeout, maxTokens } =
-      resolveAccessModelPlan(prompt || "", accessPlan);
-    const intent = classifyIntent(prompt || "");
+    const modelPolicy = resolveAiRouteModelPolicy({
+      route: "chat",
+      prompt: prompt || "",
+      accessPlan,
+    });
+    const intent = modelPolicy.intent;
     logAiRoute("/api/chat", {
       accessPlan: accessPlan || "free",
       intent,
       inputChars: String(prompt || "").length,
-      model: primary,
+      plan_tier: modelPolicy.planTier,
+      model: modelPolicy.primaryModel,
+      model_primary: modelPolicy.primaryModel,
+      model_fallback_chain: modelPolicy.fallbackModels,
     });
     const compactData = buildCompactData(currentData || {});
     const systemInstruction = buildSystemInstruction(targetLanguage, compactData);
@@ -3601,35 +3834,36 @@ app.post("/api/chat", async (req, res) => {
       req.body.replyTo
     );
 
-    let usedModel = primary;
+    let usedModel = modelPolicy.primaryModel;
     let fallbackUsed = false;
     let aiText = "";
     let timing = { ttftMs: 0, totalMs: 0 };
-
-    try {
-      const result = await callOpenRouterText({
-        model: primary,
-        timeoutMs: primaryTimeout,
-        messages,
-        maxTokens,
-        referer: req.headers.referer,
-      });
-      aiText = result.text;
-      timing = { ttftMs: result.ttftMs, totalMs: result.totalMs };
-    } catch (error) {
-      fallbackUsed = true;
-      usedModel = secondary;
-      const result = await callOpenRouterText({
-        model: secondary,
-        timeoutMs: secondaryTimeout,
-        messages,
-        maxTokens: Math.max(maxTokens, 400),
-        referer: req.headers.referer,
-      });
-      aiText = result.text;
-      timing = { ttftMs: result.ttftMs, totalMs: result.totalMs };
-      console.warn("Primary model failed, fallback used:", String(error));
+    let lastRouteError = null;
+    for (let idx = 0; idx < modelPolicy.modelFallbackChain.length; idx += 1) {
+      const candidateModel = modelPolicy.modelFallbackChain[idx];
+      const candidateTimeout = idx === 0 ? modelPolicy.primaryTimeout : modelPolicy.secondaryTimeout;
+      const candidateMaxTokens = idx === 0 ? modelPolicy.maxTokens : Math.max(modelPolicy.maxTokens, 400);
+      try {
+        const result = await callOpenRouterText({
+          model: candidateModel,
+          timeoutMs: candidateTimeout,
+          messages,
+          maxTokens: candidateMaxTokens,
+          referer: req.headers.referer,
+        });
+        usedModel = candidateModel;
+        fallbackUsed = idx > 0;
+        aiText = result.text;
+        timing = { ttftMs: result.ttftMs, totalMs: result.totalMs };
+        if (idx > 0) {
+          console.warn("Primary model failed, fallback used:", String(lastRouteError || ""));
+        }
+        break;
+      } catch (candidateError) {
+        lastRouteError = candidateError;
+      }
     }
+    if (!aiText && lastRouteError) throw lastRouteError;
 
     const textWithoutJson = String(aiText || "")
       .replace(/\`\`\`json\n?[\s\S]*?\n?\`\`\`/g, "")
@@ -3651,6 +3885,10 @@ app.post("/api/chat", async (req, res) => {
       metadata: {
         processing_mode: "ai_proxy",
         model_used: usedModel,
+        model_primary: modelPolicy.primaryModel,
+        model_fallback_chain: modelPolicy.fallbackModels,
+        plan_tier: modelPolicy.planTier,
+        final_model_used: usedModel,
         fallback_used: fallbackUsed,
         ttft_ms: timing.ttftMs,
         total_ms: Date.now() - started,
@@ -3691,14 +3929,20 @@ app.post("/api/chat/stream", async (req, res) => {
       return;
     }
     const targetLanguage = language || "Indonesian";
-    const { primary, secondary, primaryTimeout, secondaryTimeout, maxTokens } =
-      resolveAccessModelPlan(prompt || "", accessPlan);
-    const intent = classifyIntent(prompt || "");
+    const modelPolicy = resolveAiRouteModelPolicy({
+      route: "chat_stream",
+      prompt: prompt || "",
+      accessPlan,
+    });
+    const intent = modelPolicy.intent;
     logAiRoute("/api/chat/stream", {
       accessPlan: accessPlan || "free",
       intent,
       inputChars: String(prompt || "").length,
-      model: primary,
+      plan_tier: modelPolicy.planTier,
+      model: modelPolicy.primaryModel,
+      model_primary: modelPolicy.primaryModel,
+      model_fallback_chain: modelPolicy.fallbackModels,
     });
     const compactData = buildCompactData(currentData || {});
     const systemInstruction = buildSystemInstruction(targetLanguage, compactData);
@@ -3714,7 +3958,7 @@ app.post("/api/chat/stream", async (req, res) => {
     res.setHeader("Connection", "keep-alive");
     res.flushHeaders();
 
-    let usedModel = primary;
+    let usedModel = modelPolicy.primaryModel;
     let fallbackUsed = false;
     let fullText = "";
     let hasEmittedToken = false;
@@ -3736,15 +3980,25 @@ app.post("/api/chat/stream", async (req, res) => {
       ttftMs = streamResult.ttftMs;
     };
 
-    try {
-      await runStream(primary, primaryTimeout, maxTokens);
-    } catch (error) {
-      if (hasEmittedToken) throw error;
-      fallbackUsed = true;
-      usedModel = secondary;
-      await runStream(secondary, secondaryTimeout, Math.max(maxTokens, 400));
-      console.warn("Primary stream failed, fallback used:", String(error));
+    let lastRouteError = null;
+    for (let idx = 0; idx < modelPolicy.modelFallbackChain.length; idx += 1) {
+      const candidateModel = modelPolicy.modelFallbackChain[idx];
+      const candidateTimeout = idx === 0 ? modelPolicy.primaryTimeout : modelPolicy.secondaryTimeout;
+      const candidateMaxTokens = idx === 0 ? modelPolicy.maxTokens : Math.max(modelPolicy.maxTokens, 400);
+      try {
+        usedModel = candidateModel;
+        fallbackUsed = idx > 0;
+        await runStream(candidateModel, candidateTimeout, candidateMaxTokens);
+        if (idx > 0) {
+          console.warn("Primary stream failed, fallback used:", String(lastRouteError || ""));
+        }
+        break;
+      } catch (candidateError) {
+        if (hasEmittedToken) throw candidateError;
+        lastRouteError = candidateError;
+      }
     }
+    if (!fullText && lastRouteError) throw lastRouteError;
 
     const textWithoutJson = String(fullText || "")
       .replace(/\`\`\`json\n?[\s\S]*?\n?\`\`\`/g, "")
@@ -3767,6 +4021,10 @@ app.post("/api/chat/stream", async (req, res) => {
       metadata: {
         processing_mode: "ai_proxy",
         model_used: usedModel,
+        model_primary: modelPolicy.primaryModel,
+        model_fallback_chain: modelPolicy.fallbackModels,
+        plan_tier: modelPolicy.planTier,
+        final_model_used: usedModel,
         fallback_used: fallbackUsed,
         ttft_ms: ttftMs,
         total_ms: Date.now() - started,
@@ -3809,23 +4067,45 @@ Rules:
 - Practical and directly actionable
 - No numbering, no markdown, no explanation
 - Return valid JSON object only: {"suggestions":["...","...","..."]}`;
-    const usedModel = isFreeAccess(accessPlan) ? OPENROUTER_MODEL_FREE : (OPENROUTER_MODEL_QUICK_SUGGEST.includes(":free") ? OPENROUTER_MODEL_FAST : OPENROUTER_MODEL_QUICK_SUGGEST);
+    const modelPolicy = resolveAiRouteModelPolicy({
+      route: "quick_suggestions",
+      prompt: query,
+      accessPlan,
+    });
+    let usedModel = modelPolicy.primaryModel;
+    let fallbackUsed = false;
     logAiRoute("/api/quick-suggestions", {
       accessPlan: accessPlan || "free",
       inputChars: query.length,
-      model: usedModel,
+      plan_tier: modelPolicy.planTier,
+      model: modelPolicy.primaryModel,
+      model_primary: modelPolicy.primaryModel,
+      model_fallback_chain: modelPolicy.fallbackModels,
     });
 
-    const result = await callOpenRouterText({
-      model: usedModel,
-      timeoutMs: 12000,
-      maxTokens: 120,
-      referer: req.headers.referer,
-      messages: [{ role: "user", content: prompt }],
-    });
+    let result = null;
+    let lastRouteError = null;
+    for (let idx = 0; idx < modelPolicy.modelFallbackChain.length; idx += 1) {
+      const candidateModel = modelPolicy.modelFallbackChain[idx];
+      try {
+        result = await callOpenRouterText({
+          model: candidateModel,
+          timeoutMs: 12000,
+          maxTokens: 120,
+          referer: req.headers.referer,
+          messages: [{ role: "user", content: prompt }],
+        });
+        usedModel = candidateModel;
+        fallbackUsed = idx > 0;
+        break;
+      } catch (candidateError) {
+        lastRouteError = candidateError;
+      }
+    }
+    if (!result && lastRouteError) throw lastRouteError;
 
     let parsed = null;
-    const textResult = String(result.text || "").trim();
+    const textResult = String(result?.text || "").trim();
     try {
       parsed = JSON.parse(textResult);
     } catch {
@@ -3841,8 +4121,21 @@ Rules:
       : [];
 
     if (!suggestions.length) throw new Error("No suggestions returned");
-    return res.json({ suggestions });
+    return res.json({
+      suggestions,
+      metadata: {
+        model_used: usedModel,
+        model_primary: modelPolicy.primaryModel,
+        model_fallback_chain: modelPolicy.fallbackModels,
+        plan_tier: modelPolicy.planTier,
+        final_model_used: usedModel,
+        fallback_used: fallbackUsed,
+      },
+    });
   } catch (error) {
+    if (isOpenRouterRateLimitError(error)) {
+      return res.status(429).json({ error: getOpenRouterRateLimitMessage() });
+    }
     return res.status(503).json({ error: error?.message || "Quick suggestions unavailable" });
   }
 });
@@ -3869,29 +4162,49 @@ app.post("/api/report/recommendations", async (req, res) => {
       } catch (_authErr) { /* non-authed request */ }
     }
 
-    const usedModel = isFreeAccess(accessPlan)
-      ? (OPENROUTER_MODEL_REPORT_RECOMMENDATION.includes(":free") ? OPENROUTER_MODEL_REPORT_RECOMMENDATION : "deepseek/deepseek-v4-flash:free")
-      : (OPENROUTER_MODEL_REPORT_RECOMMENDATION.includes(":free") ? OPENROUTER_MODEL_FAST : OPENROUTER_MODEL_REPORT_RECOMMENDATION);
+    const modelPolicy = resolveAiRouteModelPolicy({
+      route: "report_recommendations",
+      prompt: JSON.stringify(currentData || {}).slice(0, 4000),
+      accessPlan,
+    });
+    let usedModel = modelPolicy.primaryModel;
+    let fallbackUsed = false;
 
     logAiRoute("/api/report/recommendations", {
       accessPlan: accessPlan || "free",
-      model: usedModel,
+      plan_tier: modelPolicy.planTier,
+      model: modelPolicy.primaryModel,
+      model_primary: modelPolicy.primaryModel,
+      model_fallback_chain: modelPolicy.fallbackModels,
     });
 
-    const result = await callOpenRouterText({
-      model: usedModel,
-      timeoutMs: 18000,
-      maxTokens: 220,
-      referer: req.headers.referer,
-      messages: [
-        {
-          role: "user",
-          content: buildReportRecommendationPrompt(targetLanguage, currentData),
-        },
-      ],
-    });
+    let result = null;
+    let lastRouteError = null;
+    for (let idx = 0; idx < modelPolicy.modelFallbackChain.length; idx += 1) {
+      const candidateModel = modelPolicy.modelFallbackChain[idx];
+      try {
+        result = await callOpenRouterText({
+          model: candidateModel,
+          timeoutMs: 18000,
+          maxTokens: 220,
+          referer: req.headers.referer,
+          messages: [
+            {
+              role: "user",
+              content: buildReportRecommendationPrompt(targetLanguage, currentData),
+            },
+          ],
+        });
+        usedModel = candidateModel;
+        fallbackUsed = idx > 0;
+        break;
+      } catch (candidateError) {
+        lastRouteError = candidateError;
+      }
+    }
+    if (!result && lastRouteError) throw lastRouteError;
 
-    const aiResult = parseReportAiResult(result.text);
+    const aiResult = parseReportAiResult(result?.text);
     if (!aiResult.recommendations.length && aiResult.healthScore === null) {
       throw new Error("No report AI result returned");
     }
@@ -3903,11 +4216,20 @@ app.post("/api/report/recommendations", async (req, res) => {
       metadata: {
         processing_mode: "report_recommendation",
         model_used: usedModel,
-        ttft_ms: result.ttftMs,
+        model_primary: modelPolicy.primaryModel,
+        model_fallback_chain: modelPolicy.fallbackModels,
+        plan_tier: modelPolicy.planTier,
+        final_model_used: usedModel,
+        fallback_used: fallbackUsed,
+        ttft_ms: result?.ttftMs,
         total_ms: Date.now() - started,
       },
     });
   } catch (error) {
+    if (isOpenRouterRateLimitError(error)) {
+      console.warn("Report Recommendation Rate Limited:", error?.message || error);
+      return res.status(429).json({ error: getOpenRouterRateLimitMessage() });
+    }
     console.error("Report Recommendation Error:", error);
     return res.status(503).json({ error: error?.message || "Report recommendations unavailable" });
   }
