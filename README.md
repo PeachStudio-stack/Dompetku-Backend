@@ -97,6 +97,7 @@ pm2 logs Dompetku-BackendOnly --lines 100
 - `POST /api/iap/google/verify`
 - `POST /api/push/token`
 - `POST /api/push/chat`
+- `POST /api/push/chat/broadcast`
 
 ## Contoh test dari VPS
 
@@ -136,6 +137,15 @@ curl -sS -X POST http://127.0.0.1:3000/api/push/chat \
   -H "x-internal-key: INTERNAL_API_KEY_VALUE" \
   -H "Content-Type: application/json" \
   -d '{"userId":"TARGET_SUPABASE_USER_ID","conversationId":"conv_123","messageText":"Halo user target","senderName":"Agen Dompetku"}'
+```
+
+### Kirim push chat ke semua user Android
+
+```bash
+curl -sS -X POST http://127.0.0.1:3000/api/push/chat/broadcast \
+  -H "x-internal-key: INTERNAL_API_KEY_VALUE" \
+  -H "Content-Type: application/json" \
+  -d '{"conversationId":"broadcast","messageText":"Halo semua, ini notifikasi broadcast dari Dompetku","senderName":"Agen Dompetku"}'
 ```
 
 ## Catatan keamanan

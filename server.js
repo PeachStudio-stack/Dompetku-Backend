@@ -2248,12 +2248,12 @@ const resolveFirebaseProjectId = () => {
   return fromAccount;
 };
 
-const sendFcmDataMessage = async ({ token, data }) => {
+const sendFcmDataMessage = async ({ token, data, accessToken: providedAccessToken }) => {
   const projectId = resolveFirebaseProjectId();
   if (!projectId) throw new Error("FIREBASE_PROJECT_ID is missing.");
   if (!token) throw new Error("FCM token is required.");
 
-  const accessToken = await getFirebaseMessagingAccessToken();
+  const accessToken = providedAccessToken || await getFirebaseMessagingAccessToken();
   const response = await fetch(`https://fcm.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/messages:send`, {
     method: "POST",
     headers: {
@@ -2274,6 +2274,36 @@ const sendFcmDataMessage = async ({ token, data }) => {
     throw new Error(`FCM send failed (${response.status}): ${errorText}`);
   }
   return response.json();
+};
+
+const assertInternalApiKey = (req) => {
+  const internalKey = toSafeTrimmed(process.env.INTERNAL_API_KEY);
+  const internalKeyHeader = toSafeTrimmed(req.headers["x-internal-key"]);
+  return Boolean(internalKey && internalKeyHeader && internalKeyHeader === internalKey);
+};
+
+const readAllAndroidDeviceTokens = async () => {
+  const pageSize = 1000;
+  const rows = [];
+  for (let offset = 0; offset < 50; offset += pageSize) {
+    const page = await supabaseRestFetch(
+      `${DEVICE_TOKEN_TABLE}?platform=eq.android&select=user_id,fcm_token,updated_at&order=updated_at.desc&limit=${pageSize}&offset=${offset}`
+    );
+    const items = Array.isArray(page) ? page : [];
+    rows.push(...items);
+    if (items.length < pageSize) break;
+  }
+
+  const byToken = new Map();
+  for (const row of rows) {
+    const token = toSafeTrimmed(row?.fcm_token);
+    if (!token || byToken.has(token)) continue;
+    byToken.set(token, {
+      userId: toSafeTrimmed(row?.user_id),
+      token,
+    });
+  }
+  return Array.from(byToken.values());
 };
 
 const resolveFamilyContext = async (userId) => {
@@ -3037,6 +3067,73 @@ app.post("/api/push/chat", requireSupabaseUser, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ error: error?.message || "Gagal kirim push chat." });
+  }
+});
+
+app.post("/api/push/chat/broadcast", async (req, res) => {
+  try {
+    if (!assertInternalApiKey(req)) {
+      return res.status(401).json({ error: "Internal API key tidak valid." });
+    }
+
+    const conversationId = toSafeTrimmed(req.body?.conversationId || "broadcast");
+    const messageId = toSafeTrimmed(req.body?.messageId || `broadcast_${Date.now()}`);
+    const senderName = toSafeTrimmed(req.body?.senderName || "Agen Dompetku");
+    const messageText = toSafeTrimmed(req.body?.messageText);
+    const avatarUrl = toSafeTrimmed(req.body?.avatarUrl);
+    const timestamp = String(Number(req.body?.timestamp) || Date.now());
+
+    if (!messageText) return res.status(400).json({ error: "messageText wajib diisi." });
+
+    const targets = await readAllAndroidDeviceTokens();
+    if (!targets.length) {
+      return res.json({ ok: true, sent: 0, failed: 0, totalTargets: 0, failures: [] });
+    }
+
+    const accessToken = await getFirebaseMessagingAccessToken();
+    const data = {
+      conversationId,
+      messageId,
+      senderName,
+      messageText,
+      timestamp,
+      avatarUrl: avatarUrl || "",
+    };
+
+    const failures = [];
+    let sent = 0;
+    const concurrency = Math.max(1, Math.min(20, Number(req.body?.concurrency) || 10));
+    let cursor = 0;
+
+    const worker = async () => {
+      while (cursor < targets.length) {
+        const current = targets[cursor];
+        cursor += 1;
+        try {
+          await sendFcmDataMessage({ token: current.token, data, accessToken });
+          sent += 1;
+        } catch (error) {
+          failures.push({
+            userId: current.userId,
+            error: String(error?.message || "unknown_error").slice(0, 500),
+          });
+        }
+      }
+    };
+
+    await Promise.all(Array.from({ length: Math.min(concurrency, targets.length) }, () => worker()));
+
+    return res.json({
+      ok: failures.length === 0,
+      sent,
+      failed: failures.length,
+      totalTargets: targets.length,
+      conversationId,
+      messageId,
+      failures: failures.slice(0, 25),
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Gagal broadcast push chat." });
   }
 });
 
