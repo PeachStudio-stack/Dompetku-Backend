@@ -2185,11 +2185,17 @@ const supabaseRestFetch = async (pathWithQuery, init = {}) => {
     },
   });
   if (!response.ok) {
-    const text = await response.text();
+    const text = await response.text().catch(() => "");
     throw new Error(`Supabase REST ${response.status}: ${text}`);
   }
   if (response.status === 204) return null;
-  return response.json();
+  const text = await response.text().catch(() => "");
+  if (!text || !text.trim()) return null;
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    throw new Error(`Failed to parse Supabase JSON response: ${err.message}. Raw content: ${text}`);
+  }
 };
 
 const firstRow = (value) => (Array.isArray(value) ? value[0] : value);
