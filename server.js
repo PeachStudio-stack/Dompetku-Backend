@@ -130,6 +130,99 @@ const getBearerTokenFromRequest = (req) => {
   return authHeader.toLowerCase().startsWith("bearer ") ? authHeader.slice(7).trim() : "";
 };
 
+const getUserIdFromRequest = async (req) => {
+  const token = getBearerTokenFromRequest(req);
+  if (!token) return null;
+  try {
+    const authUser = await verifySupabaseUserAccessToken(token);
+    return authUser?.id || null;
+  } catch (err) {
+    return null;
+  }
+};
+
+const savePendingAction = async (id, userId, type, data) => {
+  if (userId) {
+    try {
+      await supabaseRestFetch('agent_pending_confirmations', {
+        method: 'POST',
+        body: JSON.stringify({
+          id,
+          user_id: userId,
+          type,
+          data,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        })
+      });
+      return;
+    } catch (dbErr) {
+      console.error("[savePendingAction] Database save failed, falling back to memory:", dbErr);
+    }
+  }
+  // Fallback to memory
+  if (type === 'confirmation') {
+    pendingActionConfirmations.set(id, {
+      id,
+      createdAt: Date.now(),
+      ...data
+    });
+  } else if (type === 'selection') {
+    pendingActionSelections.set(id, {
+      id,
+      createdAt: Date.now(),
+      ...data
+    });
+  }
+};
+
+const getPendingAction = async (id, userId, type) => {
+  if (userId) {
+    try {
+      const rows = await supabaseRestFetch(
+        `agent_pending_confirmations?id=eq.${encodeURIComponent(id)}&type=eq.${encodeURIComponent(type)}&select=*`
+      ).catch(() => null);
+      const row = firstRow(rows);
+      if (row) {
+        return {
+          id: row.id,
+          createdAt: new Date(row.created_at).getTime(),
+          ...row.data
+        };
+      }
+    } catch (dbErr) {
+      console.error("[getPendingAction] Database lookup failed:", dbErr);
+    }
+  }
+  // Fallback to memory
+  if (type === 'confirmation') {
+    return pendingActionConfirmations.get(id);
+  } else if (type === 'selection') {
+    return pendingActionSelections.get(id);
+  }
+  return null;
+};
+
+const deletePendingAction = async (id, userId, type) => {
+  if (userId) {
+    try {
+      await supabaseRestFetch(
+        `agent_pending_confirmations?id=eq.${encodeURIComponent(id)}&type=eq.${encodeURIComponent(type)}`,
+        { method: 'DELETE' }
+      ).catch(() => null);
+    } catch (dbErr) {
+      console.error("[deletePendingAction] Database delete failed:", dbErr);
+    }
+  }
+  // Always delete from memory to be clean
+  if (type === 'confirmation') {
+    pendingActionConfirmations.delete(id);
+  } else if (type === 'selection') {
+    pendingActionSelections.delete(id);
+  }
+};
+
+
 const requireSupabaseUser = async (req, res, next) => {
   try {
     const accessToken = getBearerTokenFromRequest(req);
@@ -189,6 +282,15 @@ const cleanupExpiredActionConfirmations = () => {
       pendingActionSelections.delete(id);
     }
   }
+
+  // Database cleanup in background (fire-and-forget)
+  const cutoff = new Date(Date.now() - ACTION_CONFIRM_TTL_MS).toISOString();
+  supabaseRestFetch(
+    `agent_pending_confirmations?created_at=lt.${encodeURIComponent(cutoff)}`,
+    { method: "DELETE" }
+  ).catch((err) => {
+    console.error("[cleanupExpiredActionConfirmations] DB cleanup error:", err?.message || err);
+  });
 };
 
 const ACTION_CONFIRMATION_EXEMPTIONS = new Set(["calculateFinanceMetrics"]);
@@ -3516,11 +3618,13 @@ app.post("/api/agent/actions", async (req, res) => {
     const { currentData, language, accessPlan: clientAccessPlan } = req.body || {};
     // Server-side subscription verification: get userId from JWT if present
     let accessPlan = clientAccessPlan || "free";
+    let userId = null;
     const bearerToken = getBearerTokenFromRequest(req);
     if (bearerToken) {
       try {
         const authUser = await verifySupabaseUserAccessToken(bearerToken);
         if (authUser?.id) {
+          userId = authUser.id;
           const dbPlan = await resolveUserAccessPlanFromDB(authUser.id);
           if (dbPlan !== null) accessPlan = dbPlan;
         }
@@ -3676,9 +3780,7 @@ app.post("/api/agent/actions", async (req, res) => {
         });
       }
 
-      pendingActionSelections.set(selectionId, {
-        id: selectionId,
-        createdAt: Date.now(),
+      await savePendingAction(selectionId, userId, "selection", {
         context: {
           matchedEntity: matched,
           candidates,
@@ -3729,9 +3831,7 @@ app.post("/api/agent/actions", async (req, res) => {
     if (confirmationActions.length) {
       const confirmationId = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
       const summary = buildConfirmationRequestMessage(confirmationActions);
-      pendingActionConfirmations.set(confirmationId, {
-        id: confirmationId,
-        createdAt: Date.now(),
+      await savePendingAction(confirmationId, userId, "confirmation", {
         actions: confirmationActions,
         summary,
       });
@@ -3815,8 +3915,9 @@ app.post("/api/agent/actions/confirm", async (req, res) => {
         error_domain: "confirm_error",
       });
     }
+    const userId = await getUserIdFromRequest(req);
     cleanupExpiredActionConfirmations();
-    const pending = pendingActionConfirmations.get(id);
+    const pending = await getPendingAction(id, userId, 'confirmation');
     if (!pending) {
       console.warn("[confirm-pipeline]", JSON.stringify({ status: "confirmed_failed", confirmation_id: id, error_code: "confirmation_not_found" }));
       return res.status(404).json({
@@ -3826,7 +3927,7 @@ app.post("/api/agent/actions/confirm", async (req, res) => {
         error_domain: "confirm_error",
       });
     }
-    pendingActionConfirmations.delete(id);
+    await deletePendingAction(id, userId, 'confirmation');
     console.log(
       "[confirm-pipeline]",
       JSON.stringify({
@@ -3872,7 +3973,8 @@ app.post("/api/agent/actions/cancel", async (req, res) => {
     if (!id) {
       return res.status(400).json({ ok: false, error: "confirmationId wajib diisi." });
     }
-    pendingActionConfirmations.delete(id);
+    const userId = await getUserIdFromRequest(req);
+    await deletePendingAction(id, userId, 'confirmation');
     return res.json({ ok: true, cancelled: true });
   } catch (error) {
     return res.status(500).json({
@@ -3890,8 +3992,9 @@ app.post("/api/agent/actions/select", async (req, res) => {
     if (!id || !option) {
       return res.status(400).json({ ok: false, error: "selectionId dan optionId wajib diisi." });
     }
+    const userId = await getUserIdFromRequest(req);
     cleanupExpiredActionConfirmations();
-    const pending = pendingActionSelections.get(id);
+    const pending = await getPendingAction(id, userId, 'selection');
     if (!pending) {
       return res.status(404).json({ ok: false, error: "Pilihan tidak ditemukan atau kadaluarsa." });
     }
@@ -3899,7 +4002,7 @@ app.post("/api/agent/actions/select", async (req, res) => {
     if (!selected) {
       return res.status(400).json({ ok: false, error: "Opsi pilihan tidak valid." });
     }
-    pendingActionSelections.delete(id);
+    await deletePendingAction(id, userId, 'selection');
 
     const actions = Array.isArray(selected.actions)
       ? selected.actions.filter((action) => isAllowedAgentAction(action))
@@ -3915,9 +4018,7 @@ app.post("/api/agent/actions/select", async (req, res) => {
 
     const confirmationId = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
     const summary = buildConfirmationRequestMessage(actions);
-    pendingActionConfirmations.set(confirmationId, {
-      id: confirmationId,
-      createdAt: Date.now(),
+    await savePendingAction(confirmationId, userId, "confirmation", {
       actions,
       summary,
     });
