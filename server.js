@@ -82,6 +82,45 @@ const getGooglePlayAccessToken = async () => {
   return token.token;
 };
 
+const resolveFirebaseServiceAccount = () => {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    const parsed = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    return {
+      projectId: parsed.project_id || "",
+      clientEmail: parsed.client_email || "",
+      privateKey: String(parsed.private_key || "").replace(/\\n/g, "\n"),
+    };
+  }
+  if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+    const parsed = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+    return {
+      projectId: parsed.project_id || "",
+      clientEmail: parsed.client_email || "",
+      privateKey: String(parsed.private_key || "").replace(/\\n/g, "\n"),
+    };
+  }
+  return {
+    projectId: process.env.FIREBASE_PROJECT_ID || "",
+    clientEmail: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || "",
+    privateKey: String(process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
+  };
+};
+
+const getFirebaseMessagingAccessToken = async () => {
+  const { clientEmail, privateKey } = resolveFirebaseServiceAccount();
+  if (!clientEmail || !privateKey) {
+    throw new Error("Firebase service account credentials are missing.");
+  }
+  const client = new JWT({
+    email: clientEmail,
+    key: privateKey,
+    scopes: ["https://www.googleapis.com/auth/firebase.messaging"],
+  });
+  const token = await client.getAccessToken();
+  if (!token.token) throw new Error("Failed to obtain Firebase Messaging access token.");
+  return token.token;
+};
+
 const verifyGoogleSubscription = async (purchaseToken) => {
   if (!GOOGLE_PLAY_PACKAGE_NAME) {
     throw new Error("GOOGLE_PLAY_PACKAGE_NAME is missing.");
@@ -658,6 +697,7 @@ const PROMO_CODE_TABLE = "promo.codes";
 const RECURRING_RULE_TABLE = "recurring_transaction_rules";
 const RECURRING_RUN_TABLE = "recurring_transaction_runs";
 const SUBSCRIPTION_TABLE = "subscriptions";
+const DEVICE_TOKEN_TABLE = "user_device_tokens";
 const DEFAULT_TIMEZONE = "Asia/Jakarta";
 const DEFAULT_ACCOUNT_NAME = "Total Keuangan";
 const TRANSACTION_TOOL_PARAMETERS = {
@@ -2199,6 +2239,42 @@ const supabaseRestFetch = async (pathWithQuery, init = {}) => {
 };
 
 const firstRow = (value) => (Array.isArray(value) ? value[0] : value);
+const toSafeTrimmed = (value) => String(value || "").trim();
+
+const resolveFirebaseProjectId = () => {
+  const fromEnv = toSafeTrimmed(process.env.FIREBASE_PROJECT_ID);
+  if (fromEnv) return fromEnv;
+  const fromAccount = toSafeTrimmed(resolveFirebaseServiceAccount().projectId);
+  return fromAccount;
+};
+
+const sendFcmDataMessage = async ({ token, data }) => {
+  const projectId = resolveFirebaseProjectId();
+  if (!projectId) throw new Error("FIREBASE_PROJECT_ID is missing.");
+  if (!token) throw new Error("FCM token is required.");
+
+  const accessToken = await getFirebaseMessagingAccessToken();
+  const response = await fetch(`https://fcm.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/messages:send`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json; charset=UTF-8",
+    },
+    body: JSON.stringify({
+      message: {
+        token,
+        data,
+        android: { priority: "high" },
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new Error(`FCM send failed (${response.status}): ${errorText}`);
+  }
+  return response.json();
+};
 
 const resolveFamilyContext = async (userId) => {
   try {
@@ -2514,92 +2590,28 @@ const collectCategorySeedsFromSnapshot = (accountingData) => {
 };
 
 const readUserMasterCategories = async (userId, includeArchived = false) => {
-  const archivedFilter = includeArchived ? "" : "&is_archived=eq.false";
-  const rows = await supabaseRestFetch(
-    `${CATEGORY_TABLE}?user_id=eq.${encodeURIComponent(
-      userId
-    )}${archivedFilter}&select=id,user_id,category_type,name,normalized_name,is_archived,source,created_at,updated_at&order=category_type.asc&order=name.asc`
-  );
-  return Array.isArray(rows) ? rows : [];
+  return [];
 };
 
 const upsertMasterCategories = async (userId, items = []) => {
-  const deduped = new Map();
-  for (const item of items) {
-    const categoryType = normalizeCategoryType(item?.category_type || item?.type || item?.section);
-    const name = normalizeCategoryName(item?.name);
-    if (!categoryType || !name) continue;
-    const normalizedName = normalizeCategorySlug(name);
-    if (!normalizedName) continue;
-    deduped.set(`${categoryType}:${normalizedName}`, {
-      user_id: userId,
-      category_type: categoryType,
-      name,
-      normalized_name: normalizedName,
-      is_archived: false,
-      source: String(item?.source || "manual").trim().toLowerCase() || "manual",
-      updated_at: new Date().toISOString(),
-    });
-  }
-  if (!deduped.size) return [];
-
-  const rows = await supabaseRestFetch(
-    `${CATEGORY_TABLE}?on_conflict=user_id,category_type,normalized_name&select=id,user_id,category_type,name,normalized_name,is_archived,source,created_at,updated_at`,
-    {
-      method: "POST",
-      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
-      body: JSON.stringify(Array.from(deduped.values())),
-    }
-  );
-  return Array.isArray(rows) ? rows : [];
+  return [];
 };
 
 const buildSnapshotCategoriesFromMaster = (rows, previous) => {
-  const active = (Array.isArray(rows) ? rows : []).filter((item) => !item?.is_archived);
-  const byType = {
-    income: [],
-    expense: [],
-    saving: [],
-    debt_payment: [],
-    asset: [],
-  };
-  for (const row of active) {
-    const categoryType = normalizeCategoryType(row.category_type);
-    if (!categoryType) continue;
-    byType[categoryType].push(row.name);
-  }
-
-  const debtList = sortUnique(byType.debt_payment);
   const prev = normalizeAccountingData(previous || {}).categories;
   return {
-    income: sortUnique(byType.income.length ? byType.income : prev.income),
-    expenses: sortUnique(byType.expense.length ? byType.expense : prev.expenses),
-    assets: sortUnique(byType.asset.length ? byType.asset : prev.assets),
-    debts: debtList.length ? debtList : sortUnique(prev.debts),
-    debt_payment: debtList.length ? debtList : sortUnique(prev.debt_payment),
-    saving: sortUnique(byType.saving.length ? byType.saving : prev.saving),
+    income: sortUnique(prev.income),
+    expenses: sortUnique(prev.expenses),
+    assets: sortUnique(prev.assets),
+    debts: sortUnique(prev.debts),
+    debt_payment: sortUnique(prev.debt_payment),
+    saving: sortUnique(prev.saving),
   };
 };
 
 const ensureCategoryMasterAndMirrorSnapshot = async (userId, rawAccountingData) => {
   const normalized = normalizeAccountingData(rawAccountingData || {});
-  let rows = await readUserMasterCategories(userId, true);
-
-  if (!rows.length) {
-    const seeds = collectCategorySeedsFromSnapshot(normalized).map((item) => ({
-      ...item,
-      source: "seed",
-    }));
-    await upsertMasterCategories(userId, seeds);
-    rows = await readUserMasterCategories(userId, true);
-  }
-
-  const categories = buildSnapshotCategoriesFromMaster(rows, normalized.categories);
-  const mirrored = normalizeAccountingData({
-    ...normalized,
-    categories,
-  });
-  return { mirrored, rows };
+  return { mirrored: normalized, rows: [] };
 };
 
 const readUserBootstrapData = async (userId) => {
@@ -2932,6 +2944,99 @@ app.get("/api/notification-messages", requireSupabaseUser, async (_req, res) => 
     return res.json(messages);
   } catch (error) {
     return res.status(500).json({ error: error?.message || "Failed to read notification messages." });
+  }
+});
+
+app.post("/api/push/token", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = String(req.authUser.id);
+    const fcmToken = toSafeTrimmed(req.body?.fcmToken);
+    const platform = toSafeTrimmed(req.body?.platform || "android");
+    const deviceId = toSafeTrimmed(req.body?.deviceId);
+
+    if (!fcmToken) return res.status(400).json({ error: "fcmToken wajib diisi." });
+
+    const rows = await supabaseRestFetch(`${DEVICE_TOKEN_TABLE}?on_conflict=user_id,device_id&select=*`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify([
+        {
+          user_id: userId,
+          fcm_token: fcmToken,
+          platform: platform || "android",
+          device_id: deviceId || `device-${Date.now()}`,
+          updated_at: new Date().toISOString(),
+        },
+      ]),
+    });
+
+    return res.json({ ok: true, token: firstRow(rows) || null });
+  } catch (error) {
+    return res.status(500).json({
+      error: error?.message || "Gagal menyimpan token push.",
+      hint: "Pastikan tabel user_device_tokens sudah dibuat di Supabase.",
+    });
+  }
+});
+
+app.post("/api/push/chat", requireSupabaseUser, async (req, res) => {
+  try {
+    const authUserId = String(req.authUser.id);
+    const internalKeyHeader = toSafeTrimmed(req.headers["x-internal-key"]);
+    const internalKey = toSafeTrimmed(process.env.INTERNAL_API_KEY);
+    const isInternal = internalKey && internalKeyHeader && internalKeyHeader === internalKey;
+
+    const requestedUserId = toSafeTrimmed(req.body?.userId);
+    const targetUserId = requestedUserId || authUserId;
+    if (!isInternal && targetUserId !== authUserId) {
+      return res.status(403).json({ error: "Tidak boleh mengirim push ke user lain." });
+    }
+
+    const conversationId = toSafeTrimmed(req.body?.conversationId || "default");
+    const messageId = toSafeTrimmed(req.body?.messageId || `msg_${Date.now()}`);
+    const senderName = toSafeTrimmed(req.body?.senderName || "Agen Dompetku");
+    const messageText = toSafeTrimmed(req.body?.messageText);
+    const avatarUrl = toSafeTrimmed(req.body?.avatarUrl);
+    const directFcmToken = toSafeTrimmed(req.body?.fcmToken);
+    const timestamp = String(Number(req.body?.timestamp) || Date.now());
+
+    if (!messageText) return res.status(400).json({ error: "messageText wajib diisi." });
+
+    let fcmToken = directFcmToken;
+    if (!fcmToken) {
+      const rows = await supabaseRestFetch(
+        `${DEVICE_TOKEN_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&platform=eq.android&select=fcm_token,updated_at&order=updated_at.desc&limit=1`
+      ).catch(() => null);
+      fcmToken = toSafeTrimmed(firstRow(rows)?.fcm_token);
+    }
+    if (!fcmToken) {
+      return res.status(404).json({
+        error: "FCM token user belum terdaftar.",
+        hint: "Panggil POST /api/push/token dari device user setelah login.",
+      });
+    }
+
+    const fcmResponse = await sendFcmDataMessage({
+      token: fcmToken,
+      data: {
+        conversationId,
+        messageId,
+        senderName,
+        messageText,
+        timestamp,
+        avatarUrl: avatarUrl || "",
+      },
+    });
+
+    return res.json({
+      ok: true,
+      targetUserId,
+      conversationId,
+      messageId,
+      fcmResponse,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Gagal kirim push chat." });
   }
 });
 

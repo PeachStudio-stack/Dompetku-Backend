@@ -35,6 +35,9 @@ Wajib isi:
 - `OPENROUTER_MODEL_FREE=deepseek/deepseek-v4-flash:free`
 - `OPENROUTER_MODEL_REPORT_RECOMMENDATION=deepseek/deepseek-v4-flash:free`
 - `CORS_ALLOWED_ORIGINS` (domain frontend kamu + origin Capacitor: `http://localhost`, `https://localhost`, `capacitor://localhost`)
+- `FIREBASE_PROJECT_ID` (untuk FCM HTTP v1 push notifikasi)
+- `GOOGLE_SERVICE_ACCOUNT_JSON` atau kombinasi `GOOGLE_SERVICE_ACCOUNT_EMAIL` + `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY`
+- `INTERNAL_API_KEY` (opsional, untuk mengizinkan backend kirim push ke user lain secara server-to-server)
 
 Contoh:
 
@@ -92,6 +95,8 @@ pm2 logs Dompetku-BackendOnly --lines 100
 - `GET /api/promocodes/public`
 - `POST /api/promocodes/redeem`
 - `POST /api/iap/google/verify`
+- `POST /api/push/token`
+- `POST /api/push/chat`
 
 ## Contoh test dari VPS
 
@@ -103,6 +108,34 @@ curl -sS http://127.0.0.1:3000/health
 curl -sS -X POST http://127.0.0.1:3000/api/chat \
   -H "Content-Type: application/json" \
   -d '{"prompt":"catat makan 20 ribu","currentData":{"income":{},"expenses":{},"savings":{},"debts":{},"assets":{},"budgets":{},"goals":{},"transactions":[]},"language":"Indonesian"}'
+```
+
+### Register token device user
+
+```bash
+curl -sS -X POST http://127.0.0.1:3000/api/push/token \
+  -H "Authorization: Bearer SUPABASE_USER_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"fcmToken":"USER_DEVICE_FCM_TOKEN","platform":"android","deviceId":"android-user-1"}'
+```
+
+### Kirim push chat ke user sendiri
+
+```bash
+curl -sS -X POST http://127.0.0.1:3000/api/push/chat \
+  -H "Authorization: Bearer SUPABASE_USER_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"conversationId":"conv_123","messageText":"Halo dari backend","senderName":"Agen Dompetku"}'
+```
+
+### Kirim push chat ke user lain (internal server key)
+
+```bash
+curl -sS -X POST http://127.0.0.1:3000/api/push/chat \
+  -H "Authorization: Bearer SUPABASE_USER_ACCESS_TOKEN" \
+  -H "x-internal-key: INTERNAL_API_KEY_VALUE" \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"TARGET_SUPABASE_USER_ID","conversationId":"conv_123","messageText":"Halo user target","senderName":"Agen Dompetku"}'
 ```
 
 ## Catatan keamanan
