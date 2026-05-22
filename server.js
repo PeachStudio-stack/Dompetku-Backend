@@ -7,11 +7,18 @@ const cors = require("cors");
 const helmet = require("helmet");
 const { rateLimit } = require("express-rate-limit");
 const { JWT } = require("google-auth-library");
+const fs = require("fs");
 
 const app = express();
 const pendingActionConfirmations = new Map();
 const pendingActionSelections = new Map();
 const ACTION_CONFIRM_TTL_MS = 10 * 60 * 1000;
+const NOTIFICATION_MESSAGES_FILE = path.join(__dirname, "notification-messages.txt");
+const DEFAULT_NOTIFICATION_MESSAGES = {
+  morning: ["Selamat pagi! Yuk cek dompet hari ini sebelum mulai aktivitas."],
+  afternoon: ["Sore ini sempatkan lihat pengeluaranmu, biar budget tetap aman."],
+  night: ["Sebelum tidur, cek lagi transaksi hari ini supaya catatan tetap rapi."],
+};
 
 const PORT = Number(process.env.PORT || 3000);
 const OPENROUTER_URL = process.env.OPENROUTER_URL || "https://openrouter.ai/api/v1/chat/completions";
@@ -524,6 +531,8 @@ const PLAN_DB_MAP = {
   rajin: "personal",
   freedoom: "family_pro",
 };
+const AUTO_TRANSACTION_PLAN_CODES = new Set(["personal", "family_pro", "rajin", "freedoom", "freedom"]);
+const AUTO_TRANSACTION_ACCESS_ERROR = "Fitur Transaksi Otomatis tersedia untuk paket Rajin dan Freedom/Family Pro.";
 const NODE_ENV = String(process.env.NODE_ENV || "development").toLowerCase();
 const IS_PRODUCTION = NODE_ENV === "production";
 const TRUST_PROXY_RAW = String(process.env.TRUST_PROXY || "loopback").trim();
@@ -939,6 +948,40 @@ const isAllowedOrigin = (origin) => {
     return parsed.hostname === "localhost" && LOCALHOST_ORIGIN_PROTOCOLS.has(parsed.protocol);
   } catch {
     return false;
+  }
+};
+
+const parseNotificationMessages = (rawText) => {
+  const next = {
+    morning: [],
+    afternoon: [],
+    night: [],
+  };
+  let currentSection = null;
+  for (const rawLine of String(rawText || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const sectionMatch = line.match(/^\[(morning|afternoon|night)\]$/i);
+    if (sectionMatch) {
+      currentSection = sectionMatch[1].toLowerCase();
+      continue;
+    }
+    if (currentSection) next[currentSection].push(line);
+  }
+  return {
+    morning: next.morning.length ? next.morning : DEFAULT_NOTIFICATION_MESSAGES.morning,
+    afternoon: next.afternoon.length ? next.afternoon : DEFAULT_NOTIFICATION_MESSAGES.afternoon,
+    night: next.night.length ? next.night : DEFAULT_NOTIFICATION_MESSAGES.night,
+  };
+};
+
+const readNotificationMessages = async () => {
+  try {
+    const raw = await fs.promises.readFile(NOTIFICATION_MESSAGES_FILE, "utf8");
+    return parseNotificationMessages(raw);
+  } catch (error) {
+    console.warn("[notification-messages] using defaults:", error?.message);
+    return DEFAULT_NOTIFICATION_MESSAGES;
   }
 };
 
@@ -1590,12 +1633,6 @@ const streamOpenRouterText = async (params) => {
   };
 };
 
-const parsePositiveInt = (v, fallback = 1) => {
-  const num = Number(v);
-  if (!Number.isFinite(num) || num <= 0) return fallback;
-  return Math.max(1, Math.round(num));
-};
-
 const toYmd = (date) => date.toISOString().slice(0, 10);
 const parseYmd = (value) => {
   if (!value) return null;
@@ -1692,7 +1729,7 @@ const normalizeRecurringRuleInput = (input, userId, now = new Date()) => {
     method: String(input.method || input.metode || "Auto").trim() || "Auto",
     account_name: String(input.account_name || input.account || DEFAULT_ACCOUNT_NAME).trim() || DEFAULT_ACCOUNT_NAME,
     frequency,
-    interval_value: parsePositiveInt(input.interval_value ?? input.interval ?? 1, 1),
+    interval_value: 1,
     run_time_local: parseTimeHHMM(input.run_time_local || input.time || "12:00"),
     weekdays: clampWeekdays(input.weekdays),
     month_days: clampMonthDays(input.month_days),
@@ -1729,19 +1766,18 @@ const computeNextRunUtc = (rule, fromDate) => {
     if (serial < startLocalSerial) return false;
     if (endSerial !== null && serial > endSerial) return false;
     if (rule.frequency === "daily") {
-      const diff = serial - startLocalSerial;
-      return diff % Math.max(1, rule.interval_value || 1) === 0;
+      return true;
     }
     if (rule.frequency === "weekly") {
       const weekdays = rule.weekdays.length ? rule.weekdays : [1];
       if (!weekdays.includes(weekday)) return false;
       const weekIndex = Math.floor((serial - weeklyAnchorMonday) / 7);
-      return weekIndex >= 0 && weekIndex % Math.max(1, rule.interval_value || 1) === 0;
+      return weekIndex >= 0;
     }
     const monthDays = rule.month_days.length ? rule.month_days : [startD];
     if (!monthDays.includes(d)) return false;
     const mdiff = monthsDiff(y, m, startY, startM);
-    return mdiff >= 0 && mdiff % Math.max(1, rule.interval_value || 1) === 0;
+    return mdiff >= 0;
   };
 
   for (let offset = 0; offset <= maxDaysScan; offset += 1) {
@@ -1996,6 +2032,39 @@ const resolveUserAccessPlanFromDB = async (userId) => {
   } catch (err) {
     console.warn("[resolveUserAccessPlanFromDB] failed:", err?.message);
     return null; // null = fallback to client-provided value
+  }
+};
+
+const normalizePlanCode = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_");
+
+const isAutoTransactionPlanEligible = (plan) => AUTO_TRANSACTION_PLAN_CODES.has(normalizePlanCode(plan));
+
+const resolveAutoTransactionAccess = async (targetUserId) => {
+  try {
+    const [overrideRows, subRows] = await Promise.all([
+      supabaseRestFetch(`${ACCESS_OVERRIDE_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&select=role&limit=1`).catch(() => null),
+      supabaseRestFetch(
+        `${SUBSCRIPTION_TABLE}?user_id=eq.${encodeURIComponent(
+          targetUserId
+        )}&status=eq.active&select=plan,status&order=created_at.desc&limit=1`
+      ).catch(() => null),
+    ]);
+    const override = firstRow(overrideRows);
+    if (override?.role === "admin") return { ok: true, plan: "admin" };
+
+    const sub = firstRow(subRows);
+    const plan = normalizePlanCode(sub?.plan);
+    return {
+      ok: sub?.status === "active" && isAutoTransactionPlanEligible(plan),
+      plan,
+    };
+  } catch (error) {
+    console.warn("[resolveAutoTransactionAccess] failed:", error?.message);
+    return { ok: false, plan: "" };
   }
 };
 
@@ -2330,6 +2399,15 @@ const runRecurringRuleOnce = async (rule, now) => {
 
 const processRecurringRuleCatchup = async (rule, now) => {
   let currentRule = { ...rule };
+  const autoAccess = await resolveAutoTransactionAccess(currentRule.user_id);
+  if (!autoAccess.ok) {
+    const nextRun = computeNextRunUtc(currentRule, new Date(now.getTime() + 60_000));
+    await updateRecurringRuleRow(currentRule.id, {
+      next_run_at_utc: nextRun ? nextRun.toISOString() : null,
+      is_active: Boolean(nextRun) && currentRule.is_active,
+    });
+    return;
+  }
   let safety = 0;
   while (
     currentRule.is_active &&
@@ -2439,6 +2517,15 @@ app.get("/api/me/bootstrap", requireSupabaseUser, async (req, res) => {
     return res.json(await readUserBootstrapData(userId));
   } catch (error) {
     return res.status(500).json({ error: error?.message || "Failed to load user bootstrap data." });
+  }
+});
+
+app.get("/api/notification-messages", requireSupabaseUser, async (_req, res) => {
+  try {
+    const messages = await readNotificationMessages();
+    return res.json(messages);
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "Failed to read notification messages." });
   }
 });
 
@@ -2767,6 +2854,8 @@ app.get("/api/recurring-rules", requireSupabaseUser, async (req, res) => {
     const userId = req.authUser.id;
     const familyCtx = await resolveFamilyContext(userId);
     const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+    const autoAccess = await resolveAutoTransactionAccess(targetUserId);
+    if (!autoAccess.ok) return res.status(403).json({ error: AUTO_TRANSACTION_ACCESS_ERROR });
 
     const rows = await supabaseRestFetch(
       `${RECURRING_RULE_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&order=created_at.desc`
@@ -2782,6 +2871,8 @@ app.post("/api/recurring-rules", requireSupabaseUser, async (req, res) => {
     const userId = req.authUser.id;
     const familyCtx = await resolveFamilyContext(userId);
     const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+    const autoAccess = await resolveAutoTransactionAccess(targetUserId);
+    if (!autoAccess.ok) return res.status(403).json({ error: AUTO_TRANSACTION_ACCESS_ERROR });
 
     if (familyCtx.inFamily && !familyCtx.permissions.can_create) {
       return res.status(403).json({ error: "Anda tidak memiliki izin untuk menambah aturan transaksi berulang." });
@@ -2806,6 +2897,8 @@ app.patch("/api/recurring-rules/:id", requireSupabaseUser, async (req, res) => {
     const userId = req.authUser.id;
     const familyCtx = await resolveFamilyContext(userId);
     const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+    const autoAccess = await resolveAutoTransactionAccess(targetUserId);
+    if (!autoAccess.ok) return res.status(403).json({ error: AUTO_TRANSACTION_ACCESS_ERROR });
 
     if (familyCtx.inFamily && !familyCtx.permissions.can_edit) {
       return res.status(403).json({ error: "Anda tidak memiliki izin untuk mengubah aturan transaksi berulang." });
@@ -2836,6 +2929,8 @@ app.delete("/api/recurring-rules/:id", requireSupabaseUser, async (req, res) => 
     const userId = req.authUser.id;
     const familyCtx = await resolveFamilyContext(userId);
     const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+    const autoAccess = await resolveAutoTransactionAccess(targetUserId);
+    if (!autoAccess.ok) return res.status(403).json({ error: AUTO_TRANSACTION_ACCESS_ERROR });
 
     if (familyCtx.inFamily && !familyCtx.permissions.can_delete) {
       return res.status(403).json({ error: "Anda tidak memiliki izin untuk menghapus aturan transaksi berulang." });
@@ -2860,6 +2955,8 @@ app.get("/api/recurring-runs", requireSupabaseUser, async (req, res) => {
     const userId = req.authUser.id;
     const familyCtx = await resolveFamilyContext(userId);
     const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+    const autoAccess = await resolveAutoTransactionAccess(targetUserId);
+    if (!autoAccess.ok) return res.status(403).json({ error: AUTO_TRANSACTION_ACCESS_ERROR });
 
     const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
     const rows = await supabaseRestFetch(
@@ -2877,6 +2974,8 @@ app.post("/api/recurring-rules/:id/sync-timezone", requireSupabaseUser, async (r
     const userId = req.authUser.id;
     const familyCtx = await resolveFamilyContext(userId);
     const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
+    const autoAccess = await resolveAutoTransactionAccess(targetUserId);
+    if (!autoAccess.ok) return res.status(403).json({ error: AUTO_TRANSACTION_ACCESS_ERROR });
 
     if (familyCtx.inFamily && !familyCtx.permissions.can_edit) {
       return res.status(403).json({ error: "Anda tidak memiliki izin untuk mensinkronisasi timezone aturan keluarga." });
