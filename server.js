@@ -2213,6 +2213,350 @@ const syncSnapshotFinance = (accountingData, tx) => {
   return next;
 };
 
+const normalizeName = (value) => {
+  if (!value) return "";
+  const text = String(value)
+    .replace(/[^\p{L}\p{N}\s&\-_]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text
+    .split(" ")
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .join(" ");
+};
+
+const parseAmount = (value) => {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, Math.round(value));
+  if (typeof value !== "string") return 0;
+  const lowered = value.toLowerCase();
+  const isUsd = lowered.includes("$") || lowered.includes("usd");
+  const text = lowered
+    .replace(/rp/gi, "")
+    .replace(/juta/gi, "000000")
+    .replace(/jt/gi, "000000")
+    .replace(/ribu/gi, "000")
+    .replace(/rb/gi, "000")
+    .replace(/k/gi, "000")
+    .replace(/[^\d.-]/g, "");
+  const parsed = Number(text);
+  if (!Number.isFinite(parsed)) return 0;
+  const normalizedValue = Math.max(0, parsed);
+  if (isUsd) return Math.round(normalizedValue * 17000);
+  return Math.round(normalizedValue);
+};
+
+const findBestKey = (query, keys) => {
+  const normalize = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+  const normalizedQuery = normalize(query);
+  if (!normalizedQuery) return null;
+  const exact = keys.find((name) => normalize(name) === normalizedQuery);
+  if (exact) return exact;
+  return keys.find((name) => normalize(name).includes(normalizedQuery) || normalizedQuery.includes(normalize(name))) || null;
+};
+
+const ensureTxDate = (value) => {
+  const localYmdHms = () => {
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, "0");
+    const d = String(now.getDate()).padStart(2, "0");
+    const hh = String(now.getHours()).padStart(2, "0");
+    const mm = String(now.getMinutes()).padStart(2, "0");
+    return `${y}-${m}-${d}T${hh}:${mm}`;
+  };
+  const raw = String(value || "").trim();
+  if (!raw) return localYmdHms();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return `${raw}T00:00`;
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(raw)) return raw.slice(0, 16);
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return localYmdHms();
+  const y = parsed.getFullYear();
+  const m = String(parsed.getMonth() + 1).padStart(2, "0");
+  const d = String(parsed.getDate()).padStart(2, "0");
+  const hh = String(parsed.getHours()).padStart(2, "0");
+  const mm = String(parsed.getMinutes()).padStart(2, "0");
+  return `${y}-${m}-${d}T${hh}:${mm}`;
+};
+
+const resolveWalletName = (data, candidate) => {
+  const given = normalizeName(candidate);
+  const keys = Object.keys(data.wallets || {});
+  if (!given) return keys[0] || "Total Keuangan";
+  return findBestKey(given, keys) || given;
+};
+
+const ensureWalletExists = (data, walletName, walletType = "Lainnya", startingBalance = 0) => {
+  if (data.wallets?.[walletName]) return;
+  data.wallets = {
+    ...(data.wallets || {}),
+    [walletName]: {
+      type: walletType,
+      startingBalance: Math.max(0, Math.round(startingBalance)),
+      currentBalance: Math.max(0, Math.round(startingBalance)),
+    },
+  };
+};
+
+const adjustPlanByDelta = (data, planNameRaw, delta) => {
+  const planName = normalizeName(planNameRaw || "Tabungan");
+  if (!planName || !Number.isFinite(delta) || delta === 0) return;
+  const existingName = findBestKey(planName, Object.keys(data.tabunganPlans || {})) || planName;
+  const existing = data.tabunganPlans?.[existingName];
+  const current = Math.max(0, Number(existing?.current || 0) + Math.round(delta));
+  const target = Math.max(current, Number(existing?.target || 0));
+  const now = new Date().toISOString();
+  data.tabunganPlans = {
+    ...(data.tabunganPlans || {}),
+    [existingName]: {
+      target,
+      current,
+      note: existing?.note || "",
+      createdAt: existing?.createdAt || now,
+      updatedAt: now,
+    },
+  };
+};
+
+const applyMoneyDelta = (data, tx, direction) => {
+  const amount = (Number(tx.amount) || 0) * direction;
+  const category = tx.category || "Lainnya";
+  if (!amount) return;
+  const upsert = (section, key) => {
+    const map = { ...(data[section] || {}) };
+    map[key] = Number(map[key] || 0) + amount;
+    data[section] = map;
+  };
+  if (tx.type === "income") upsert("income", category);
+  if (tx.type === "expense") upsert("expenses", category);
+  if (tx.type === "saving") upsert("savings", category);
+  if (tx.type === "asset") upsert("assets", category);
+  if (tx.type === "debt_payment") {
+    upsert("expenses", "Cicilan");
+    if (typeof data.debts?.[category] === "number") {
+      data.debts = {
+        ...(data.debts || {}),
+        [category]: Math.max(0, Number(data.debts?.[category] || 0) - amount),
+      };
+    }
+  }
+};
+
+const syncAccounts = (data) => ({
+  ...data,
+  accounts: {
+    ...(data.accounts || { assets: {}, liabilities: {}, equity: {}, revenue: {}, expenses: {} }),
+    assets: data.assets,
+    liabilities: data.debts,
+    equity: data.savings,
+    revenue: data.income,
+    expenses: data.expenses,
+  },
+});
+
+const syncWalletsWithTransactions = (data) => {
+  const next = { ...data };
+  const wallets = {};
+  for (const name of Object.keys(next.wallets || {})) {
+    wallets[name] = { ...next.wallets[name], currentBalance: next.wallets[name].startingBalance || 0 };
+  }
+  const txs = Array.isArray(next.transactions) ? next.transactions : [];
+  for (const tx of txs) {
+    const walletName = tx.account || "Total Keuangan";
+    if (!wallets[walletName]) {
+      wallets[walletName] = { type: "Lainnya", startingBalance: 0, currentBalance: 0 };
+    }
+    const amount = Number(tx.amount) || 0;
+    if (tx.type === "income") {
+      wallets[walletName].currentBalance += amount;
+    } else {
+      wallets[walletName].currentBalance -= amount;
+    }
+  }
+  next.wallets = wallets;
+  return next;
+};
+
+const syncBudgetsWithTransactions = (data) => {
+  const next = { ...data };
+  const budgets = {};
+  for (const name of Object.keys(next.budgets || {})) {
+    budgets[name] = { ...next.budgets[name], spent: 0 };
+  }
+  const txs = Array.isArray(next.transactions) ? next.transactions : [];
+  for (const tx of txs) {
+    if (tx.type !== "expense") continue;
+    const catName = tx.category || "Lainnya";
+    const budgetName = findBestKey(catName, Object.keys(budgets));
+    if (budgetName) {
+      budgets[budgetName].spent = Number(budgets[budgetName].spent || 0) + Number(tx.amount || 0);
+    }
+  }
+  next.budgets = budgets;
+  return next;
+};
+
+const normalizeAccountingDataServerSide = (data) => {
+  const cleanObj = (obj) => {
+    const next = {};
+    if (!obj || typeof obj !== "object") return next;
+    for (const key of Object.keys(obj)) {
+      if (typeof obj[key] === "number") next[key] = obj[key];
+    }
+    return next;
+  };
+  const d = data || {};
+  return {
+    wallets: isObject(d.wallets) ? d.wallets : {},
+    tabunganPlans: isObject(d.tabunganPlans) ? d.tabunganPlans : {},
+    budgets: isObject(d.budgets) ? d.budgets : {},
+    transactions: Array.isArray(d.transactions) ? d.transactions : [],
+    income: cleanObj(d.income),
+    expenses: cleanObj(d.expenses),
+    savings: cleanObj(d.savings),
+    debts: cleanObj(d.debts),
+    assets: cleanObj(d.assets),
+    categories: isObject(d.categories) ? d.categories : { income: [], expenses: [], assets: [], debts: [], saving: [], debt_payment: [] },
+  };
+};
+
+const upsertTabunganPlan = (data, nameRaw, targetRaw, currentOverride, noteRaw) => {
+  const name = normalizeName(nameRaw);
+  if (!name) return false;
+  const existingName = findBestKey(name, Object.keys(data.tabunganPlans || {})) || name;
+  const existing = data.tabunganPlans?.[existingName];
+  const target = (targetRaw !== undefined && targetRaw !== null) ? parseAmount(targetRaw) : Number(existing?.target || 0);
+  const nextCurrent = typeof currentOverride === "number" ? Math.max(0, Math.round(currentOverride)) : Number(existing?.current || 0);
+  const now = new Date().toISOString();
+  data.tabunganPlans = {
+    ...(data.tabunganPlans || {}),
+    [existingName]: {
+      target,
+      current: nextCurrent,
+      note: String(noteRaw || existing?.note || "").trim(),
+      createdAt: existing?.createdAt || now,
+      updatedAt: now,
+    },
+  };
+  return true;
+};
+
+const makeTxFromArgs = (data, args, existing) => {
+  const txType = args.type || existing?.type;
+  if (!txType) return null;
+  const amountRaw = (args.amount !== undefined || args.jumlah !== undefined) ? parseAmount(args.amount) || parseAmount(args.jumlah) : Number(existing?.amount || 0);
+  const amount = amountRaw > 0 ? amountRaw : 17000;
+  const walletName = resolveWalletName(data, args.account || existing?.account);
+  ensureWalletExists(data, walletName);
+  const baseCategory = normalizeName(args.category || args.kategori || existing?.category || "");
+  const category = baseCategory || (txType === "income" ? "Lainnya" : txType === "expense" ? "Lainnya" : txType === "saving" ? "Tabungan" : txType === "asset" ? "Investasi" : "Cicilan");
+  const tx = {
+    id: String(existing?.id || args.id || `tx_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`),
+    date: ensureTxDate(args.date || args.tanggal || existing?.date),
+    description: String(args.description || args.catatan || existing?.description || `${txType} ${category}`).trim(),
+    amount,
+    type: txType,
+    category,
+    account: walletName,
+    note: String(args.note || args.catatan || existing?.note || "").trim() || undefined,
+    source: txType === "income" ? String(args.source || args.sumber || existing?.source || "").trim() || undefined : undefined,
+    method: txType === "expense" ? String(args.method || args.metode || existing?.method || "QRIS").trim() || "QRIS" : undefined,
+  };
+  return tx;
+};
+
+const executeAgentActionsServerSide = (currentData, actions) => {
+  let next = normalizeAccountingDataServerSide(currentData);
+  const notices = [];
+  const actionSummaries = [];
+
+  for (const action of actions) {
+    const name = action?.name;
+    const args = action?.args || {};
+    if (!name) continue;
+
+    if (name === "createWallet" || name === "AddAkunDompet") {
+      const walletName = normalizeName(args.name);
+      const walletType = normalizeName(args.type) || "Lainnya";
+      const saldoAwal = parseAmount(args.saldo_awal !== undefined ? args.saldo_awal : args.startingBalance);
+      if (!walletName) continue;
+      ensureWalletExists(next, walletName, walletType, saldoAwal);
+      actionSummaries.push(`Dompet ${walletName} dibuat.`);
+      continue;
+    }
+
+    if (name === "createTabungan" || name === "createTabunganPlan") {
+      const ok = upsertTabunganPlan(next, args.name, args.target, undefined, args.note);
+      if (ok) actionSummaries.push(`Tabungan ${normalizeName(args.name)} dibuat.`);
+      continue;
+    }
+
+    if (name === "createGoal" || name === "updateTabunganPlan") {
+      const current = args.current !== undefined ? parseAmount(args.current) : undefined;
+      const existing = normalizeName(args.name);
+      if (!existing) continue;
+      const targetRaw = args.target !== undefined ? args.target : next.tabunganPlans?.[existing]?.target;
+      const ok = upsertTabunganPlan(next, args.name, targetRaw, current, args.note);
+      if (ok) actionSummaries.push(`Tabungan ${existing} diperbarui.`);
+      continue;
+    }
+
+    if (name === "addTabungan") {
+      const planName = normalizeName(args.name);
+      const amount = parseAmount(args.amount) || parseAmount(args.jumlah) || 17000;
+      if (!planName || amount <= 0) continue;
+      const walletName = resolveWalletName(next, args.account);
+      ensureWalletExists(next, walletName);
+      adjustPlanByDelta(next, planName, amount);
+      const tx = makeTxFromArgs(next, {
+        ...args,
+        type: "saving",
+        category: planName,
+        description: String(args.note || "").trim() || `Tambah tabungan ${planName}`,
+      });
+      if (!tx) continue;
+      next.transactions = [...(next.transactions || []), tx];
+      applyMoneyDelta(next, tx, 1);
+      actionSummaries.push(`Saldo tabungan ${planName} ditambah.`);
+      continue;
+    }
+
+    if (name === "createBudget" || name === "updateBudget") {
+      const budgetName = normalizeName(args.name);
+      const limit = parseAmount(args.limit);
+      if (!budgetName || limit <= 0) continue;
+      const existingName = findBestKey(budgetName, Object.keys(next.budgets || {})) || budgetName;
+      next.budgets = {
+        ...(next.budgets || {}),
+        [existingName]: {
+          limit,
+          spent: Number(next.budgets?.[existingName]?.spent || 0),
+          note: String(args.note || next.budgets?.[existingName]?.note || "").trim(),
+          updatedAt: new Date().toISOString(),
+        },
+      };
+      actionSummaries.push(`Budget ${existingName} diperbarui.`);
+      continue;
+    }
+
+    if (name === "addTransaction" || name === "createTransaction") {
+      const tx = makeTxFromArgs(next, args);
+      if (!tx) continue;
+      if (tx.type === "saving") adjustPlanByDelta(next, tx.category, tx.amount);
+      next.transactions = [...(next.transactions || []), tx];
+      applyMoneyDelta(next, tx, 1);
+      actionSummaries.push(`Transaksi ${tx.id} ditambahkan.`);
+      continue;
+    }
+  }
+
+  next = syncAccounts(next);
+  next = syncWalletsWithTransactions(next);
+  next = syncBudgetsWithTransactions(next);
+
+  return { updatedData: normalizeAccountingDataServerSide(next), notices, actionSummaries };
+};
+
 const supabaseRestFetch = async (pathWithQuery, init = {}) => {
   if (!SUPABASE_SERVICE_ROLE_KEY) throw new Error("SUPABASE_SERVICE_ROLE_KEY is missing.");
   const response = await fetch(`${SUPABASE_URL}/rest/v1/${pathWithQuery}`, {
@@ -2796,6 +3140,35 @@ const runRecurringRuleOnce = async (rule, now) => {
         executed_at_utc: new Date().toISOString(),
       }),
     });
+
+    try {
+      const tokenRows = await supabaseRestFetch(
+        `${DEVICE_TOKEN_TABLE}?user_id=eq.${encodeURIComponent(rule.user_id)}&platform=eq.android&select=fcm_token,updated_at&order=updated_at.desc&limit=1`
+      ).catch(() => null);
+      const fcmToken = toSafeTrimmed(firstRow(tokenRows)?.fcm_token);
+      if (fcmToken) {
+        const rupiah = (val) => "Rp" + Math.round(val || 0).toLocaleString("id-ID");
+        const detail = [
+          rule.description || rule.category || 'Transaksi otomatis',
+          Number(rule.amount || 0) > 0 ? rupiah(Number(rule.amount || 0)) : '',
+        ].filter(Boolean).join(' - ');
+
+        await sendFcmDataMessage({
+          token: fcmToken,
+          data: {
+            conversationId: "recurring_run",
+            messageId: `recurring_${runMarker.id}_${Date.now()}`,
+            senderName: "Dompetku",
+            messageText: `Transaksi otomatis tercatat: ${detail}`,
+            timestamp: String(Date.now()),
+            avatarUrl: "",
+          }
+        }).catch((err) => console.error("[recurring-push] failed to send push:", err.message));
+      }
+    } catch (pushErr) {
+      console.error("[recurring-push] FCM query/send failed:", pushErr.message);
+    }
+
     const nextRun = computeNextRunUtc(rule, new Date(scheduledAt.getTime() + 60_000));
     return { processed: true, nextRun };
   } catch (error) {
@@ -3067,6 +3440,128 @@ app.post("/api/push/chat", requireSupabaseUser, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ error: error?.message || "Gagal kirim push chat." });
+  }
+});
+
+app.post("/api/push/chat/reply", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = String(req.authUser.id);
+    const { conversationId, messageId, replyText } = req.body || {};
+
+    if (!replyText) {
+      return res.status(400).json({ error: "replyText wajib diisi." });
+    }
+
+    // 1. Fetch user's current finance snapshot from Supabase
+    const snapshotRows = await supabaseRestFetch(
+      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=accounting_data,data_version`
+    ).catch(() => null);
+    const snapshot = firstRow(snapshotRows) || { accounting_data: {}, data_version: 0 };
+    const currentData = snapshot.accounting_data || {};
+
+    // 2. We use empty history for notification replies
+    const history = [];
+
+    // 3. Process the reply using OpenRouter action system
+    const targetLanguage = "Indonesian";
+    const accessPlan = await resolveUserAccessPlanFromDB(userId).catch(() => "free") || "free";
+    const modelPolicy = resolveAiRouteModelPolicy({
+      route: "agent_actions",
+      prompt: replyText,
+      accessPlan,
+    });
+
+    const compactData = buildCompactData(currentData);
+    const actionSystem = buildActionSystemInstruction(targetLanguage, compactData);
+    const messages = buildOpenRouterMessages(
+      actionSystem,
+      history,
+      replyText
+    );
+
+    let usedModel = modelPolicy.primaryModel;
+    let fallbackUsed = false;
+    let result = { actions: [], assistantText: "" };
+    let lastRouteError = null;
+
+    for (let idx = 0; idx < modelPolicy.modelFallbackChain.length; idx += 1) {
+      const candidateModel = modelPolicy.modelFallbackChain[idx];
+      const candidateTimeout = idx === 0 ? modelPolicy.primaryTimeout : modelPolicy.secondaryTimeout;
+      try {
+        let candidateResult = await callOpenRouterActions({
+          model: candidateModel,
+          timeoutMs: candidateTimeout,
+          messages,
+          referer: req.headers.referer,
+          toolChoice: "auto",
+        });
+
+        if (!candidateResult.actions.length) {
+          candidateResult = await callOpenRouterActions({
+            model: candidateModel,
+            timeoutMs: candidateTimeout,
+            messages,
+            referer: req.headers.referer,
+            toolChoice: "required",
+          });
+        }
+
+        if (candidateResult.actions.length) {
+          usedModel = candidateModel;
+          fallbackUsed = idx > 0;
+          result = candidateResult;
+          break;
+        }
+      } catch (err) {
+        lastRouteError = err;
+      }
+    }
+
+    // 4. Execute any generated actions server-side
+    let executeSummary = "";
+    if (result.actions && result.actions.length > 0) {
+      const filteredActions = result.actions.filter(isAllowedAgentAction);
+      if (filteredActions.length > 0) {
+        const execution = executeAgentActionsServerSide(currentData, filteredActions);
+        const nextVersion = Date.now();
+        await supabaseRestFetch(`${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(userId)}`, {
+          method: "PATCH",
+          body: JSON.stringify({
+            accounting_data: execution.updatedData,
+            data_version: nextVersion,
+            updated_at: new Date().toISOString(),
+          }),
+        }).catch((err) => console.error("[push-reply] failed to update finance snapshot:", err.message));
+        executeSummary = execution.actionSummaries.join(" ") + " " + execution.notices.join(" ");
+      }
+    }
+
+    const responseText = result.assistantText || executeSummary || "Pesan diproses.";
+
+    // 5. Send FCM message back to the user's device
+    const tokenRows = await supabaseRestFetch(
+      `${DEVICE_TOKEN_TABLE}?user_id=eq.${encodeURIComponent(userId)}&platform=eq.android&select=fcm_token,updated_at&order=updated_at.desc&limit=1`
+    ).catch(() => null);
+    const fcmToken = toSafeTrimmed(firstRow(tokenRows)?.fcm_token);
+
+    if (fcmToken) {
+      await sendFcmDataMessage({
+        token: fcmToken,
+        data: {
+          conversationId: conversationId || "default",
+          messageId: `msg_${Date.now()}`,
+          senderName: "Agen Dompetku",
+          messageText: responseText,
+          timestamp: String(Date.now()),
+          avatarUrl: "",
+        },
+      }).catch((err) => console.error("[push-reply] failed to send FCM:", err.message));
+    }
+
+    return res.json({ ok: true, responseText });
+  } catch (error) {
+    console.error("[push-reply] Endpoint error:", error);
+    return res.status(500).json({ error: error?.message || "Gagal memproses reply chat." });
   }
 });
 
