@@ -3,6 +3,11 @@ Selamat pagi! Yuk cek dompet hari ini sebelum mulai aktivitas.
 Pagi cerah, waktunya review keuangan. Sudah catat pengeluaran semalam?
 Mulai hari dengan bijak! Cek saldo dan budget kamu di Dompetku.
 
+[noon]
+Siang ini, cek transaksi makan dan belanja agar catatan tetap rapi.
+Jangan lupa catat makan siang atau transport hari ini.
+Rehat sebentar, lihat budget harianmu sebelum lanjut aktivitas.
+
 [afternoon]
 Sore ini sempatkan lihat pengeluaranmu, biar budget tetap aman.
 Jangan lupa catat belanja siang tadi! Budget harian masih on track?

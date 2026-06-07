@@ -16,6 +16,7 @@ const ACTION_CONFIRM_TTL_MS = 10 * 60 * 1000;
 const NOTIFICATION_MESSAGES_FILE = path.join(__dirname, "notification-messages.txt");
 const DEFAULT_NOTIFICATION_MESSAGES = {
   morning: ["Selamat pagi! Yuk cek dompet hari ini sebelum mulai aktivitas."],
+  noon: ["Siang ini, cek transaksi makan dan belanja agar catatan tetap rapi."],
   afternoon: ["Sore ini sempatkan lihat pengeluaranmu, biar budget tetap aman."],
   night: ["Sebelum tidur, cek lagi transaksi hari ini supaya catatan tetap rapi."],
 };
@@ -665,15 +666,13 @@ const GOOGLE_PLAY_PACKAGE_NAME = process.env.GOOGLE_PLAY_PACKAGE_NAME || "";
 const PLAN_PRODUCT_MAP = {
   skeptis: "skeptis_monthly",
   rajin: "rajin_monthly",
-  freedoom: "freedoom_monthly",
 };
 const PLAN_DB_MAP = {
   skeptis: "starter",
   rajin: "personal",
-  freedoom: "family_pro",
 };
-const AUTO_TRANSACTION_PLAN_CODES = new Set(["personal", "family_pro", "rajin", "freedoom", "freedom"]);
-const AUTO_TRANSACTION_ACCESS_ERROR = "Fitur Transaksi Otomatis tersedia untuk paket Rajin dan Freedom/Family Pro.";
+const AUTO_TRANSACTION_PLAN_CODES = new Set(["personal", "rajin"]);
+const AUTO_TRANSACTION_ACCESS_ERROR = "Fitur Transaksi Otomatis tersedia untuk paket Middle.";
 const NODE_ENV = String(process.env.NODE_ENV || "development").toLowerCase();
 const IS_PRODUCTION = NODE_ENV === "production";
 const TRUST_PROXY_RAW = String(process.env.TRUST_PROXY || "loopback").trim();
@@ -1096,6 +1095,7 @@ const isAllowedOrigin = (origin) => {
 const parseNotificationMessages = (rawText) => {
   const next = {
     morning: [],
+    noon: [],
     afternoon: [],
     night: [],
   };
@@ -1103,7 +1103,7 @@ const parseNotificationMessages = (rawText) => {
   for (const rawLine of String(rawText || "").split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
-    const sectionMatch = line.match(/^\[(morning|afternoon|night)\]$/i);
+    const sectionMatch = line.match(/^\[(morning|noon|afternoon|night)\]$/i);
     if (sectionMatch) {
       currentSection = sectionMatch[1].toLowerCase();
       continue;
@@ -1112,6 +1112,7 @@ const parseNotificationMessages = (rawText) => {
   }
   return {
     morning: next.morning.length ? next.morning : DEFAULT_NOTIFICATION_MESSAGES.morning,
+    noon: next.noon.length ? next.noon : DEFAULT_NOTIFICATION_MESSAGES.noon,
     afternoon: next.afternoon.length ? next.afternoon : DEFAULT_NOTIFICATION_MESSAGES.afternoon,
     night: next.night.length ? next.night : DEFAULT_NOTIFICATION_MESSAGES.night,
   };
@@ -2751,7 +2752,7 @@ const canUserCreateFamily = async (userId) => {
     if (override?.role === "admin") return true;
 
     const sub = firstRow(subRows);
-    if (sub?.status === "active" && (sub.plan === "family" || sub.plan === "family_pro" || sub.plan === "premium")) {
+    if (sub?.status === "active" && (sub.plan === "personal" || sub.plan === "family" || sub.plan === "family_pro" || sub.plan === "premium")) {
       return true;
     }
     return false;
@@ -3067,14 +3068,14 @@ const updateRecurringRuleRow = async (ruleId, patch) => {
   return Array.isArray(data) ? data[0] : data;
 };
 
-const buildRecurringTransaction = (rule, scheduledFor) => ({
+const buildRecurringTransaction = (rule, scheduledFor, resolvedAccount) => ({
   id: `rtx_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
   date: toYmd(scheduledFor),
   description: rule.description || `Auto ${rule.category}`,
   amount: Number(rule.amount) || 0,
   type: rule.tx_type || "expense",
   category: rule.category || "Lainnya",
-  account: rule.account_name || DEFAULT_ACCOUNT_NAME,
+  account: resolvedAccount || rule.account_name || DEFAULT_ACCOUNT_NAME,
   note: `[AUTO:${rule.id}] ${rule.description || ""}`.trim(),
   source: "recurring_rule",
   method: rule.method || "Auto",
@@ -3101,8 +3102,16 @@ const runRecurringRuleOnce = async (rule, now) => {
     );
     const snapshot = Array.isArray(rows) ? rows[0] : rows;
     const accountingData = isObject(snapshot?.accounting_data) ? snapshot.accounting_data : {};
-    const walletName = rule.account_name || DEFAULT_ACCOUNT_NAME;
-    const walletBalance = Number(accountingData?.wallets?.[walletName]?.currentBalance || 0);
+    const wallets = accountingData?.wallets || {};
+    const walletKeys = Object.keys(wallets);
+    // Smart wallet resolution: fallback to first available wallet if rule's account_name doesn't exist
+    const preferredWallet = rule.account_name || DEFAULT_ACCOUNT_NAME;
+    const resolvedWalletName = wallets[preferredWallet]
+      ? preferredWallet
+      : walletKeys.length > 0
+        ? walletKeys[0]
+        : preferredWallet;
+    const walletBalance = Number(wallets[resolvedWalletName]?.currentBalance || 0);
     const amount = Number(rule.amount) || 0;
 
     if (rule.tx_type !== "income" && walletBalance < amount) {
@@ -3119,7 +3128,7 @@ const runRecurringRuleOnce = async (rule, now) => {
       return { processed: true, nextRun };
     }
 
-    const tx = buildRecurringTransaction(rule, scheduledAt);
+    const tx = buildRecurringTransaction(rule, scheduledAt, resolvedWalletName);
     const synced = syncSnapshotFinance(accountingData, tx);
     const nextVersion = Date.now();
     await supabaseRestFetch(`${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(rule.user_id)}`, {
@@ -4122,7 +4131,7 @@ app.post("/api/family/create", requireSupabaseUser, async (req, res) => {
     // 2. Check if eligible (premium subscription / family package)
     const eligible = await canUserCreateFamily(userId);
     if (!eligible) {
-      return res.status(403).json({ error: "Akun Anda harus berlangganan paket Family atau Family Pro untuk membuat keluarga." });
+      return res.status(403).json({ error: "Akun Anda harus berlangganan paket Middle untuk membuat keluarga." });
     }
 
     // 3. Generate unique invite code
@@ -5439,19 +5448,10 @@ app.post("/api/iap/google/verify", async (req, res) => {
   }
 });
 
-if (SUPABASE_SERVICE_ROLE_KEY) {
-  const runTick = async () => {
-    try {
-      await runRecurringSchedulerTick();
-    } catch (error) {
-      console.error("[recurring] scheduler tick failed:", error);
-    }
-  };
-  void runTick();
-  setInterval(runTick, 60_000);
-} else {
-  console.warn("[recurring] scheduler disabled: SUPABASE_SERVICE_ROLE_KEY missing.");
-}
+// Local node-based recurring scheduler is disabled because the scheduler has been migrated 
+// to a Supabase Deno Edge Function ('recurring-scheduler') triggered by pg_cron.
+console.info("[recurring] local node-based scheduler disabled (migrated to Supabase Edge Function & pg_cron).");
+
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`BackendOnly running on http://0.0.0.0:${PORT}`);
