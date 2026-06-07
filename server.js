@@ -28,12 +28,13 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const OPENROUTER_MODEL_FAST = process.env.OPENROUTER_MODEL_FAST || "deepseek/deepseek-v4-flash";
 const OPENROUTER_MODEL_HEAVY = process.env.OPENROUTER_MODEL_HEAVY || "deepseek/deepseek-v4-flash";
 const OPENROUTER_MODEL_QUICK_SUGGEST =
-  process.env.OPENROUTER_MODEL_QUICK_SUGGEST || "deepseek/deepseek-v4-flash:free";
-const OPENROUTER_MODEL_FREE = process.env.OPENROUTER_MODEL_FREE || "deepseek/deepseek-v4-flash:free";
+  process.env.OPENROUTER_MODEL_QUICK_SUGGEST || "deepseek/deepseek-v4-flash";
+const OPENROUTER_MODEL_FREE = process.env.OPENROUTER_MODEL_FREE || "deepseek/deepseek-v4-flash";
 const OPENROUTER_MODEL_REPORT_RECOMMENDATION =
-  process.env.OPENROUTER_MODEL_REPORT_RECOMMENDATION || "deepseek/deepseek-v4-flash:free";
+  process.env.OPENROUTER_MODEL_REPORT_RECOMMENDATION || "deepseek/deepseek-v4-flash";
 const OPENROUTER_MODEL_OCR =
-  process.env.OPENROUTER_MODEL_OCR || process.env.OPENROUTER_MODEL_HEAVY || "google/gemini-2.0-flash-001";
+  process.env.OPENROUTER_MODEL_OCR ||
+  "google/gemini-2.0-flash-001,google/gemini-2.5-flash,google/gemini-flash-1.5";
 const OPENROUTER_TIMEOUT_FAST_MS = Number(process.env.OPENROUTER_TIMEOUT_FAST_MS || 12000);
 const OPENROUTER_TIMEOUT_HEAVY_MS = Number(process.env.OPENROUTER_TIMEOUT_HEAVY_MS || 25000);
 const OPENROUTER_TIMEOUT_OCR_MS = Number(process.env.OPENROUTER_TIMEOUT_OCR_MS || 20000);
@@ -232,6 +233,9 @@ const normalizeOcrText = (value) =>
     .trim()
     .slice(0, MAX_OCR_TEXT_CHARS);
 
+const parseModelChain = (value) =>
+  uniqueModelChain(String(value || "").split(",").map((model) => model.trim()));
+
 const callOpenRouterOcr = async ({ file, language, referer }) => {
   assertOpenRouterKey();
   if (!file?.buffer?.length) throw new Error("File kosong.");
@@ -259,14 +263,32 @@ Bahasa output: ${targetLanguage}.`;
     },
   ];
 
-  const result = await callOpenRouterText({
-    model: OPENROUTER_MODEL_OCR,
-    timeoutMs: OPENROUTER_TIMEOUT_OCR_MS,
-    messages,
-    maxTokens: 900,
-    referer,
-  });
-  return normalizeOcrText(result.text);
+  const modelChain = parseModelChain(OPENROUTER_MODEL_OCR);
+  let lastError = null;
+  for (const model of modelChain) {
+    try {
+      const result = await callOpenRouterText({
+        model,
+        timeoutMs: OPENROUTER_TIMEOUT_OCR_MS,
+        messages,
+        maxTokens: 900,
+        referer,
+      });
+      return normalizeOcrText(result.text);
+    } catch (error) {
+      lastError = error;
+      console.warn(
+        "[attachment-ocr-model]",
+        JSON.stringify({
+          status: "failed",
+          model,
+          error_code: getAiErrorCode(error),
+        })
+      );
+      if (!isRetriableAiError(error)) break;
+    }
+  }
+  throw lastError || new Error("Server OCR belum mendukung tipe file ini.");
 };
 
 const savePendingAction = async (id, userId, type, data) => {
