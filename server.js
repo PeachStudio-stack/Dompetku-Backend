@@ -1890,7 +1890,7 @@ const buildOpenRouterMessages = (systemInstruction, history, currentPrompt, repl
   return openRouterMsgs;
 };
 
-const openRouterFetch = async ({ model, timeoutMs, messages, maxTokens, stream, referer }) => {
+const openRouterFetch = async ({ model, timeoutMs, messages, maxTokens, stream, referer, sessionId }) => {
   assertOpenRouterKey();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -1905,6 +1905,7 @@ const openRouterFetch = async ({ model, timeoutMs, messages, maxTokens, stream, 
           "Content-Type": "application/json",
           "HTTP-Referer": referer || "http://localhost:3000",
           "X-Title": "Dompetku BackendOnly",
+          ...(sessionId ? { "x-session-id": String(sessionId) } : {}),
         },
         body: JSON.stringify({
           model,
@@ -1912,6 +1913,7 @@ const openRouterFetch = async ({ model, timeoutMs, messages, maxTokens, stream, 
           max_tokens: maxTokens,
           stream: Boolean(stream),
           messages,
+          ...(sessionId ? { session_id: String(sessionId) } : {}),
         }),
       });
     } catch (error) {
@@ -1964,7 +1966,7 @@ const TRANSACTION_ACTION_NAMES = new Set(["addTransaction", "createTransaction"]
 const TRANSACTION_TYPE_VALUES = new Set(["income", "expense", "saving", "debt_payment", "asset"]);
 const CLASSIFICATION_CONFIDENCE_THRESHOLD = 0.78;
 
-const validateTransactionClassifications = async ({ prompt, actions, model, timeoutMs, referer }) => {
+const validateTransactionClassifications = async ({ prompt, actions, model, timeoutMs, referer, sessionId }) => {
   const transactionActions = (Array.isArray(actions) ? actions : [])
     .map((action, index) => ({ action, index }))
     .filter(({ action }) => TRANSACTION_ACTION_NAMES.has(String(action?.name || "")));
@@ -1998,6 +2000,7 @@ Return JSON only: {"classifications":[{"index":0,"type":"asset","category":"Bitc
       ],
       maxTokens: 600,
       referer,
+      sessionId,
     });
     const parsed = parseJsonObject(text);
     const rows = Array.isArray(parsed?.classifications) ? parsed.classifications : Array.isArray(parsed) ? parsed : [];
@@ -2058,6 +2061,7 @@ const callOpenRouterActions = async (params) => {
         "Content-Type": "application/json",
         "HTTP-Referer": params.referer || "http://localhost:3000",
         "X-Title": "Dompetku BackendOnly Actions",
+        ...(params.sessionId ? { "x-session-id": String(params.sessionId) } : {}),
       },
       body: JSON.stringify({
         model: params.model,
@@ -2066,6 +2070,7 @@ const callOpenRouterActions = async (params) => {
         messages: params.messages,
         tools: AGENT_ACTION_TOOLS,
         tool_choice: params.toolChoice,
+        ...(params.sessionId ? { session_id: String(params.sessionId) } : {}),
       }),
     });
     if (!response.ok) {
@@ -4524,7 +4529,7 @@ app.post("/api/agent/actions", async (req, res) => {
   const started = Date.now();
   let safePrompt = "";
   try {
-    const { currentData, language, accessPlan: clientAccessPlan } = req.body || {};
+    const { currentData, language, accessPlan: clientAccessPlan, sessionId } = req.body || {};
     // Server-side subscription verification: get userId from JWT if present
     let accessPlan = clientAccessPlan || "free";
     let userId = null;
@@ -4589,6 +4594,7 @@ app.post("/api/agent/actions", async (req, res) => {
           messages,
           referer: req.headers.referer,
           toolChoice: "auto",
+          sessionId,
         });
 
         if (!candidateResult.actions.length) {
@@ -4599,6 +4605,7 @@ app.post("/api/agent/actions", async (req, res) => {
             messages,
             referer: req.headers.referer,
             toolChoice: "required",
+            sessionId,
           });
         }
 
@@ -4654,6 +4661,7 @@ app.post("/api/agent/actions", async (req, res) => {
       model: usedModel,
       timeoutMs: Math.min(modelPolicy.primaryTimeout, modelPolicy.secondaryTimeout),
       referer: req.headers.referer,
+      sessionId,
     });
 
     cleanupExpiredActionConfirmations();
@@ -4958,7 +4966,7 @@ app.post("/api/chat", async (req, res) => {
   const started = Date.now();
   let prompt = "";
   try {
-    const { currentData, language, accessPlan: clientAccessPlan } = req.body || {};
+    const { currentData, language, accessPlan: clientAccessPlan, sessionId } = req.body || {};
     // Server-side subscription verification
     let accessPlan = clientAccessPlan || "free";
     const bearerToken = getBearerTokenFromRequest(req);
@@ -5018,6 +5026,7 @@ app.post("/api/chat", async (req, res) => {
           messages,
           maxTokens: candidateMaxTokens,
           referer: req.headers.referer,
+          sessionId,
         });
         usedModel = candidateModel;
         fallbackUsed = idx > 0;
@@ -5098,7 +5107,7 @@ app.post("/api/chat/stream", async (req, res) => {
 
   let prompt = "";
   try {
-    const { currentData, language, accessPlan: clientAccessPlan } = req.body || {};
+    const { currentData, language, accessPlan: clientAccessPlan, sessionId } = req.body || {};
     // Server-side subscription verification
     let accessPlan = clientAccessPlan || "free";
     const bearerToken = getBearerTokenFromRequest(req);
@@ -5161,6 +5170,7 @@ app.post("/api/chat/stream", async (req, res) => {
         messages,
         maxTokens: tokenBudget,
         referer: req.headers.referer,
+        sessionId,
         onToken: (chunk) => {
           hasEmittedToken = true;
           fullText += chunk;
@@ -5249,7 +5259,7 @@ app.post("/api/chat/stream", async (req, res) => {
 
 app.post("/api/quick-suggestions", async (req, res) => {
   try {
-    const { text, language, accessPlan: clientAccessPlan } = req.body || {};
+    const { text, language, accessPlan: clientAccessPlan, sessionId } = req.body || {};
     // Server-side subscription verification
     let accessPlan = clientAccessPlan || "free";
     const bearerToken = getBearerTokenFromRequest(req);
@@ -5304,6 +5314,7 @@ Rules:
           maxTokens: 120,
           referer: req.headers.referer,
           messages: [{ role: "user", content: prompt }],
+          sessionId,
         });
         usedModel = candidateModel;
         fallbackUsed = idx > 0;
@@ -5363,7 +5374,7 @@ Rules:
 app.post("/api/report/recommendations", async (req, res) => {
   const started = Date.now();
   try {
-    const { currentData, language, accessPlan: clientAccessPlan } = req.body || {};
+    const { currentData, language, accessPlan: clientAccessPlan, sessionId } = req.body || {};
     const targetLanguage = String(language || "Indonesian");
     if (!currentData || typeof currentData !== "object") {
       return res.status(400).json({ error: "Missing currentData." });
@@ -5415,6 +5426,7 @@ app.post("/api/report/recommendations", async (req, res) => {
               content: buildReportRecommendationPrompt(targetLanguage, currentData),
             },
           ],
+          sessionId,
         });
         usedModel = candidateModel;
         fallbackUsed = idx > 0;
