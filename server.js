@@ -1890,7 +1890,7 @@ const buildOpenRouterMessages = (systemInstruction, history, currentPrompt, repl
   return openRouterMsgs;
 };
 
-const openRouterFetch = async ({ model, timeoutMs, messages, maxTokens, stream, referer, sessionId }) => {
+const openRouterFetch = async ({ model, timeoutMs, messages, maxTokens, stream, referer }) => {
   assertOpenRouterKey();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -1905,7 +1905,6 @@ const openRouterFetch = async ({ model, timeoutMs, messages, maxTokens, stream, 
           "Content-Type": "application/json",
           "HTTP-Referer": referer || "http://localhost:3000",
           "X-Title": "Dompetku BackendOnly",
-          ...(sessionId ? { "x-session-id": String(sessionId) } : {}),
         },
         body: JSON.stringify({
           model,
@@ -1913,7 +1912,6 @@ const openRouterFetch = async ({ model, timeoutMs, messages, maxTokens, stream, 
           max_tokens: maxTokens,
           stream: Boolean(stream),
           messages,
-          ...(sessionId ? { session_id: String(sessionId) } : {}),
         }),
       });
     } catch (error) {
@@ -1966,7 +1964,7 @@ const TRANSACTION_ACTION_NAMES = new Set(["addTransaction", "createTransaction"]
 const TRANSACTION_TYPE_VALUES = new Set(["income", "expense", "saving", "debt_payment", "asset"]);
 const CLASSIFICATION_CONFIDENCE_THRESHOLD = 0.78;
 
-const validateTransactionClassifications = async ({ prompt, actions, model, timeoutMs, referer, sessionId }) => {
+const validateTransactionClassifications = async ({ prompt, actions, model, timeoutMs, referer }) => {
   const transactionActions = (Array.isArray(actions) ? actions : [])
     .map((action, index) => ({ action, index }))
     .filter(({ action }) => TRANSACTION_ACTION_NAMES.has(String(action?.name || "")));
@@ -2000,7 +1998,6 @@ Return JSON only: {"classifications":[{"index":0,"type":"asset","category":"Bitc
       ],
       maxTokens: 600,
       referer,
-      sessionId,
     });
     const parsed = parseJsonObject(text);
     const rows = Array.isArray(parsed?.classifications) ? parsed.classifications : Array.isArray(parsed) ? parsed : [];
@@ -2061,7 +2058,6 @@ const callOpenRouterActions = async (params) => {
         "Content-Type": "application/json",
         "HTTP-Referer": params.referer || "http://localhost:3000",
         "X-Title": "Dompetku BackendOnly Actions",
-        ...(params.sessionId ? { "x-session-id": String(params.sessionId) } : {}),
       },
       body: JSON.stringify({
         model: params.model,
@@ -2070,7 +2066,6 @@ const callOpenRouterActions = async (params) => {
         messages: params.messages,
         tools: AGENT_ACTION_TOOLS,
         tool_choice: params.toolChoice,
-        ...(params.sessionId ? { session_id: String(params.sessionId) } : {}),
       }),
     });
     if (!response.ok) {
@@ -2858,7 +2853,7 @@ const canUserCreateFamily = async (userId) => {
   try {
     const [overrideRows, subRows] = await Promise.all([
       supabaseRestFetch(`${ACCESS_OVERRIDE_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=role&limit=1`).catch(() => null),
-      supabaseRestFetch(`${SUBSCRIPTION_TABLE}?user_id=eq.${encodeURIComponent(userId)}&status=eq.active&select=plan,status&order=created_at.desc&limit=1`).catch(() => null),
+      readActiveSubscriptionForUser(userId).catch(() => null),
     ]);
     const override = firstRow(overrideRows);
     if (override?.role === "admin") return true;
@@ -2957,7 +2952,7 @@ const resolveUserAccessPlanFromDB = async (userId) => {
 
     const [overrideRows, subRows] = await Promise.all([
       supabaseRestFetch(`${ACCESS_OVERRIDE_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&select=role&limit=1`).catch(() => null),
-      supabaseRestFetch(`${SUBSCRIPTION_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&status=eq.active&select=plan,status&order=created_at.desc&limit=1`).catch(() => null),
+      readActiveSubscriptionForUser(targetUserId).catch(() => null),
     ]);
     const override = firstRow(overrideRows);
     if (override?.role === "admin") return "admin";
@@ -2978,15 +2973,84 @@ const normalizePlanCode = (value) =>
 
 const isAutoTransactionPlanEligible = (plan) => AUTO_TRANSACTION_PLAN_CODES.has(normalizePlanCode(plan));
 
+const isRealGooglePlayPurchaseToken = (token) => {
+  const value = String(token || "");
+  return value && !value.startsWith("promo_") && !value.startsWith("demo_");
+};
+
+const normalizeGoogleSubscriptionStatus = (payload) => {
+  const playState = String(payload?.subscriptionState || "");
+  const lineItems = Array.isArray(payload?.lineItems) ? payload.lineItems : [];
+  const autoRenewingItems = lineItems.filter((item) => item?.autoRenewingPlan);
+  const hasDisabledAutoRenew =
+    Boolean(payload?.canceledStateContext) ||
+    (autoRenewingItems.length > 0 && !autoRenewingItems.some((item) => item?.autoRenewingPlan?.autoRenewEnabled === true));
+
+  if (playState === "SUBSCRIPTION_STATE_ACTIVE" && !hasDisabledAutoRenew) return "active";
+  if (playState === "SUBSCRIPTION_STATE_IN_GRACE_PERIOD" || playState === "SUBSCRIPTION_STATE_ON_HOLD") return "past_due";
+  return "canceled";
+};
+
+const syncGoogleSubscriptionRow = async (row) => {
+  if (!row?.id || row.status !== "active") return row || null;
+  const purchaseToken = row.purchase_token;
+  if (!GOOGLE_PLAY_PACKAGE_NAME || !isRealGooglePlayPurchaseToken(purchaseToken)) return row;
+
+  try {
+    const verifyPayload = await verifyGoogleSubscription(purchaseToken);
+    const normalizedStatus = normalizeGoogleSubscriptionStatus(verifyPayload);
+    const googleSubscriptionState = String(verifyPayload?.subscriptionState || "") || null;
+    const expiresAt = String(verifyPayload?.lineItems?.[0]?.expiryTime || "") || null;
+
+    if (normalizedStatus === row.status) return row;
+
+    const patchPayload = {
+      status: normalizedStatus,
+      google_subscription_state: googleSubscriptionState,
+      expires_at: expiresAt,
+      raw_payload: verifyPayload,
+    };
+    const patched = await supabaseRestFetch(`${SUBSCRIPTION_TABLE}?id=eq.${encodeURIComponent(row.id)}&select=*`, {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify(patchPayload),
+    });
+    const nextRow = firstRow(patched) || { ...row, ...patchPayload };
+    console.log(
+      "[subscription-sync]",
+      JSON.stringify({
+        user_id: row.user_id || null,
+        subscription_id: row.id,
+        from_status: row.status,
+        to_status: normalizedStatus,
+        google_subscription_state: googleSubscriptionState,
+      })
+    );
+    return nextRow;
+  } catch (error) {
+    console.warn("[subscription-sync] Google Play check failed:", error?.message || error);
+    return row;
+  }
+};
+
+const readActiveSubscriptionForUser = async (userId, { syncGoogle = true } = {}) => {
+  const row = firstRow(
+    await supabaseRestFetch(
+      `${SUBSCRIPTION_TABLE}?user_id=eq.${encodeURIComponent(
+        userId
+      )}&status=eq.active&select=id,user_id,plan,status,product_id,purchase_token,google_subscription_state,created_at,expires_at&order=created_at.desc&limit=1`
+    ).catch(() => null)
+  );
+  if (!row) return null;
+  const synced = syncGoogle ? await syncGoogleSubscriptionRow(row) : row;
+  return synced?.status === "active" ? synced : null;
+};
+
 const resolveAutoTransactionAccess = async (targetUserId) => {
   try {
     const [overrideRows, subRows] = await Promise.all([
       supabaseRestFetch(`${ACCESS_OVERRIDE_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&select=role&limit=1`).catch(() => null),
-      supabaseRestFetch(
-        `${SUBSCRIPTION_TABLE}?user_id=eq.${encodeURIComponent(
-          targetUserId
-        )}&status=eq.active&select=plan,status&order=created_at.desc&limit=1`
-      ).catch(() => null),
+      readActiveSubscriptionForUser(targetUserId).catch(() => null),
     ]);
     const override = firstRow(overrideRows);
     if (override?.role === "admin") return { ok: true, plan: "admin" };
@@ -3116,12 +3180,10 @@ const readUserBootstrapData = async (userId) => {
 
   const [profile, subscription, accessOverride] = await Promise.all([
     readOrNull("profile", `profiles?id=eq.${encodeURIComponent(userId)}&select=display_name,referral_code`),
-    readOrNull(
-      "subscription",
-      `subscriptions?user_id=eq.${encodeURIComponent(
-        targetUserIdForSub
-      )}&status=eq.active&select=plan,status,created_at&order=created_at.desc&limit=1`
-    ),
+    readActiveSubscriptionForUser(targetUserIdForSub).catch((error) => {
+      console.warn("[bootstrap] subscription unavailable:", error);
+      return null;
+    }),
     readOrNull(
       "access override",
       `${ACCESS_OVERRIDE_TABLE}?user_id=eq.${encodeURIComponent(
@@ -4529,7 +4591,17 @@ app.post("/api/agent/actions", async (req, res) => {
   const started = Date.now();
   let safePrompt = "";
   try {
-    const { currentData, language, accessPlan: clientAccessPlan, sessionId } = req.body || {};
+    const { currentData, language, accessPlan: clientAccessPlan } = req.body || {};
+    const requestAgentMode = String(req.body?.agentMode || "").toLowerCase();
+    if (req.body?.readOnly === true || requestAgentMode === "assistant") {
+      return res.status(403).json({
+        ok: false,
+        actions: [],
+        confirmationRequests: [],
+        assistantText: "",
+        error: "Mode Asisten hanya read-only dan tidak boleh menjalankan Create/Edit/Delete.",
+      });
+    }
     // Server-side subscription verification: get userId from JWT if present
     let accessPlan = clientAccessPlan || "free";
     let userId = null;
@@ -4594,7 +4666,6 @@ app.post("/api/agent/actions", async (req, res) => {
           messages,
           referer: req.headers.referer,
           toolChoice: "auto",
-          sessionId,
         });
 
         if (!candidateResult.actions.length) {
@@ -4605,7 +4676,6 @@ app.post("/api/agent/actions", async (req, res) => {
             messages,
             referer: req.headers.referer,
             toolChoice: "required",
-            sessionId,
           });
         }
 
@@ -4661,7 +4731,6 @@ app.post("/api/agent/actions", async (req, res) => {
       model: usedModel,
       timeoutMs: Math.min(modelPolicy.primaryTimeout, modelPolicy.secondaryTimeout),
       referer: req.headers.referer,
-      sessionId,
     });
 
     cleanupExpiredActionConfirmations();
@@ -4966,7 +5035,7 @@ app.post("/api/chat", async (req, res) => {
   const started = Date.now();
   let prompt = "";
   try {
-    const { currentData, language, accessPlan: clientAccessPlan, sessionId } = req.body || {};
+    const { currentData, language, accessPlan: clientAccessPlan } = req.body || {};
     // Server-side subscription verification
     let accessPlan = clientAccessPlan || "free";
     const bearerToken = getBearerTokenFromRequest(req);
@@ -5026,7 +5095,6 @@ app.post("/api/chat", async (req, res) => {
           messages,
           maxTokens: candidateMaxTokens,
           referer: req.headers.referer,
-          sessionId,
         });
         usedModel = candidateModel;
         fallbackUsed = idx > 0;
@@ -5107,7 +5175,7 @@ app.post("/api/chat/stream", async (req, res) => {
 
   let prompt = "";
   try {
-    const { currentData, language, accessPlan: clientAccessPlan, sessionId } = req.body || {};
+    const { currentData, language, accessPlan: clientAccessPlan } = req.body || {};
     // Server-side subscription verification
     let accessPlan = clientAccessPlan || "free";
     const bearerToken = getBearerTokenFromRequest(req);
@@ -5170,7 +5238,6 @@ app.post("/api/chat/stream", async (req, res) => {
         messages,
         maxTokens: tokenBudget,
         referer: req.headers.referer,
-        sessionId,
         onToken: (chunk) => {
           hasEmittedToken = true;
           fullText += chunk;
@@ -5259,7 +5326,7 @@ app.post("/api/chat/stream", async (req, res) => {
 
 app.post("/api/quick-suggestions", async (req, res) => {
   try {
-    const { text, language, accessPlan: clientAccessPlan, sessionId } = req.body || {};
+    const { text, language, accessPlan: clientAccessPlan } = req.body || {};
     // Server-side subscription verification
     let accessPlan = clientAccessPlan || "free";
     const bearerToken = getBearerTokenFromRequest(req);
@@ -5314,7 +5381,6 @@ Rules:
           maxTokens: 120,
           referer: req.headers.referer,
           messages: [{ role: "user", content: prompt }],
-          sessionId,
         });
         usedModel = candidateModel;
         fallbackUsed = idx > 0;
@@ -5374,7 +5440,7 @@ Rules:
 app.post("/api/report/recommendations", async (req, res) => {
   const started = Date.now();
   try {
-    const { currentData, language, accessPlan: clientAccessPlan, sessionId } = req.body || {};
+    const { currentData, language, accessPlan: clientAccessPlan } = req.body || {};
     const targetLanguage = String(language || "Indonesian");
     if (!currentData || typeof currentData !== "object") {
       return res.status(400).json({ error: "Missing currentData." });
@@ -5426,7 +5492,6 @@ app.post("/api/report/recommendations", async (req, res) => {
               content: buildReportRecommendationPrompt(targetLanguage, currentData),
             },
           ],
-          sessionId,
         });
         usedModel = candidateModel;
         fallbackUsed = idx > 0;
@@ -5618,12 +5683,7 @@ app.post("/api/iap/google/verify", async (req, res) => {
       googleSubscriptionState = playState || null;
       googleOrderId = String(verifyPayload?.latestOrderId || verifyPayload?.lineItems?.[0]?.latestSuccessfulOrderId || "") || null;
       expiresAt = String(verifyPayload?.lineItems?.[0]?.expiryTime || "") || null;
-      if (playState === "SUBSCRIPTION_STATE_ACTIVE") normalizedStatus = "active";
-      if (playState === "SUBSCRIPTION_STATE_IN_GRACE_PERIOD") normalizedStatus = "past_due";
-      if (playState === "SUBSCRIPTION_STATE_ON_HOLD") normalizedStatus = "past_due";
-      if (playState === "SUBSCRIPTION_STATE_CANCELED" || playState === "SUBSCRIPTION_STATE_EXPIRED") {
-        normalizedStatus = "canceled";
-      }
+      normalizedStatus = normalizeGoogleSubscriptionStatus(verifyPayload);
       if (normalizedStatus === "active") paidAt = new Date().toISOString();
 
       const actualProductId = verifyPayload?.lineItems?.[0]?.productId;
@@ -5680,19 +5740,16 @@ app.post("/api/subscription/cancel", requireSupabaseUser, async (req, res) => {
     }
 
     const purchaseToken = sub.purchase_token;
+    const isRealGooglePlaySubscription = purchaseToken && isRealGooglePlayPurchaseToken(purchaseToken) && GOOGLE_PLAY_PACKAGE_NAME;
 
-    // 1. Cancel in database
-    await supabaseRestFetch(`${SUBSCRIPTION_TABLE}?id=eq.${encodeURIComponent(sub.id)}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=representation" },
-      body: JSON.stringify({ status: "canceled", google_subscription_state: "SUBSCRIPTION_STATE_CANCELED" }),
-    });
-
-    // 2. If it is a real Google Play IAP, attempt to call Play Developer API to cancel (best-effort)
-    if (purchaseToken && !purchaseToken.startsWith("promo_") && !purchaseToken.startsWith("demo_") && GOOGLE_PLAY_PACKAGE_NAME) {
+    // 1. If it is a real Google Play IAP, cancel Play billing first.
+    if (isRealGooglePlaySubscription) {
       try {
         const accessToken = await getGooglePlayAccessToken();
         const productId = sub.product_id;
+        if (!productId) {
+          return res.status(500).json({ error: "Data product subscription tidak lengkap untuk pembatalan Google Play." });
+        }
         const cancelUrl = `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(
           GOOGLE_PLAY_PACKAGE_NAME
         )}/purchases/subscriptions/${encodeURIComponent(productId)}/tokens/${encodeURIComponent(purchaseToken)}:cancel`;
@@ -5705,14 +5762,23 @@ app.post("/api/subscription/cancel", requireSupabaseUser, async (req, res) => {
           }
         });
         if (!playRes.ok) {
-          console.warn("[iap-cancel] Google Play cancellation failed:", await playRes.text());
-        } else {
-          console.log("[iap-cancel] Google Play subscription cancelled successfully");
+          const playError = await playRes.text();
+          console.warn("[iap-cancel] Google Play cancellation failed:", playError);
+          return res.status(502).json({ error: "Gagal membatalkan langganan di Google Play. Coba lagi sebentar." });
         }
+        console.log("[iap-cancel] Google Play subscription cancelled successfully");
       } catch (playErr) {
         console.warn("[iap-cancel] Failed to cancel on Google Play:", playErr.message);
+        return res.status(502).json({ error: "Gagal membatalkan langganan di Google Play. Coba lagi sebentar." });
       }
     }
+
+    // 2. Disconnect active entitlement in database after Google Play cancellation succeeds.
+    await supabaseRestFetch(`${SUBSCRIPTION_TABLE}?id=eq.${encodeURIComponent(sub.id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({ status: "canceled", google_subscription_state: "SUBSCRIPTION_STATE_CANCELED" }),
+    });
 
     return res.json({ ok: true, message: "Subscription berhasil dibatalkan." });
   } catch (err) {
