@@ -95,6 +95,10 @@ pm2 logs Dompetku-BackendOnly --lines 100
 - `GET /api/promocodes/public`
 - `POST /api/promocodes/redeem`
 - `POST /api/iap/google/verify`
+- `GET /api/notification-messages`
+- `GET /api/notifications/preferences`
+- `PUT /api/notifications/preferences`
+- `POST /api/notifications/daily/send-due` (internal key, untuk Supabase Cron)
 - `POST /api/push/token`
 - `POST /api/push/chat`
 - `POST /api/push/chat/broadcast`
@@ -118,6 +122,24 @@ curl -sS -X POST http://127.0.0.1:3000/api/push/token \
   -H "Authorization: Bearer SUPABASE_USER_ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"fcmToken":"USER_DEVICE_FCM_TOKEN","platform":"android","deviceId":"android-user-1"}'
+```
+
+### Aktifkan preferensi notifikasi harian
+
+```bash
+curl -sS -X PUT http://127.0.0.1:3000/api/notifications/preferences \
+  -H "Authorization: Bearer SUPABASE_USER_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"daily_enabled":true,"timezone_name":"Asia/Jakarta","slots":["morning","noon","afternoon","night"]}'
+```
+
+### Jalankan scheduler notifikasi harian (dipanggil Supabase Cron)
+
+```bash
+curl -sS -X POST http://127.0.0.1:3000/api/notifications/daily/send-due \
+  -H "x-internal-key: INTERNAL_API_KEY_VALUE" \
+  -H "Content-Type: application/json" \
+  -d '{"source":"manual-test"}'
 ```
 
 ### Kirim push chat ke user sendiri

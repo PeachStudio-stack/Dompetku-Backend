@@ -771,6 +771,8 @@ const RECURRING_RULE_TABLE = "recurring_transaction_rules";
 const RECURRING_RUN_TABLE = "recurring_transaction_runs";
 const SUBSCRIPTION_TABLE = "subscriptions";
 const DEVICE_TOKEN_TABLE = "user_device_tokens";
+const NOTIFICATION_PREF_TABLE = "user_notification_preferences";
+const NOTIFICATION_DELIVERY_LOG_TABLE = "notification_delivery_logs";
 const DEFAULT_TIMEZONE = "Asia/Jakarta";
 const DEFAULT_ACCOUNT_NAME = "Total Keuangan";
 const TRANSACTION_TOOL_PARAMETERS = {
@@ -1200,6 +1202,79 @@ const readNotificationMessages = async () => {
     console.warn("[notification-messages] using defaults:", error?.message);
     return DEFAULT_NOTIFICATION_MESSAGES;
   }
+};
+
+const DAILY_NOTIFICATION_SLOTS = {
+  morning: { title: "Dompetku pagi ini", hour: 7, minute: 0 },
+  noon: { title: "Cek dompet siang", hour: 12, minute: 0 },
+  afternoon: { title: "Cek dompet sore", hour: 16, minute: 0 },
+  night: { title: "Ringkas hari ini", hour: 20, minute: 0 },
+};
+const DEFAULT_DAILY_NOTIFICATION_SLOT_NAMES = Object.keys(DAILY_NOTIFICATION_SLOTS);
+
+const normalizeDailyNotificationSlots = (slots) => {
+  const input = Array.isArray(slots) ? slots : DEFAULT_DAILY_NOTIFICATION_SLOT_NAMES;
+  const normalized = input
+    .map((slot) => toSafeTrimmed(slot).toLowerCase())
+    .filter((slot) => Object.prototype.hasOwnProperty.call(DAILY_NOTIFICATION_SLOTS, slot));
+  return normalized.length ? Array.from(new Set(normalized)) : DEFAULT_DAILY_NOTIFICATION_SLOT_NAMES;
+};
+
+const normalizeTimezoneName = (value) => {
+  const candidate = toSafeTrimmed(value) || DEFAULT_TIMEZONE;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: candidate }).format(new Date());
+    return candidate;
+  } catch {
+    return DEFAULT_TIMEZONE;
+  }
+};
+
+const formatInTimezoneParts = (date, timeZone) => {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).formatToParts(date);
+  const read = (type) => parts.find((part) => part.type === type)?.value || "";
+  const hour = Number(read("hour"));
+  return {
+    year: read("year"),
+    month: read("month"),
+    day: read("day"),
+    hour: hour === 24 ? 0 : hour,
+    minute: Number(read("minute")),
+  };
+};
+
+const localDateStringFromParts = (parts) => `${parts.year}-${parts.month}-${parts.day}`;
+
+const dueNotificationSlotsForPreference = (preference, now = new Date()) => {
+  const timeZone = normalizeTimezoneName(preference?.timezone_name);
+  const parts = formatInTimezoneParts(now, timeZone);
+  const enabledSlots = normalizeDailyNotificationSlots(preference?.slots);
+  return enabledSlots.filter((slotName) => {
+    const slot = DAILY_NOTIFICATION_SLOTS[slotName];
+    return slot && slot.hour === parts.hour && slot.minute === parts.minute;
+  }).map((slotName) => ({
+    name: slotName,
+    config: DAILY_NOTIFICATION_SLOTS[slotName],
+    deliveryDate: localDateStringFromParts(parts),
+    timezoneName: timeZone,
+  }));
+};
+
+const pickNotificationMessage = (messages, slotName) => {
+  const fallback = DEFAULT_NOTIFICATION_MESSAGES[slotName]?.[0] || "Cek Dompetku hari ini.";
+  const pool = (messages?.[slotName] || [])
+    .map((item) => toSafeTrimmed(item))
+    .filter(Boolean);
+  if (!pool.length) return fallback;
+  return pool[Math.floor(Math.random() * pool.length)] || fallback;
 };
 
 const isObject = (value) => typeof value === "object" && value !== null;
@@ -3623,6 +3698,64 @@ app.get("/api/notification-messages", requireSupabaseUser, async (_req, res) => 
   }
 });
 
+app.get("/api/notifications/preferences", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = String(req.authUser.id);
+    const rows = await supabaseRestFetch(
+      `${NOTIFICATION_PREF_TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=daily_enabled,timezone_name,slots,updated_at&limit=1`
+    ).catch(() => null);
+    const row = firstRow(rows);
+    return res.json({
+      preference: {
+        daily_enabled: Boolean(row?.daily_enabled),
+        timezone_name: normalizeTimezoneName(row?.timezone_name),
+        slots: normalizeDailyNotificationSlots(row?.slots),
+        updated_at: row?.updated_at || null,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: error?.message || "Gagal membaca preferensi notifikasi.",
+      hint: "Pastikan tabel user_notification_preferences sudah dibuat di Supabase.",
+    });
+  }
+});
+
+app.put("/api/notifications/preferences", requireSupabaseUser, async (req, res) => {
+  try {
+    const userId = String(req.authUser.id);
+    const dailyEnabled = Boolean(req.body?.daily_enabled);
+    const timezoneName = normalizeTimezoneName(req.body?.timezone_name);
+    const slots = normalizeDailyNotificationSlots(req.body?.slots);
+    const rows = await supabaseRestFetch(`${NOTIFICATION_PREF_TABLE}?on_conflict=user_id&select=*`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      body: JSON.stringify([{
+        user_id: userId,
+        daily_enabled: dailyEnabled,
+        timezone_name: timezoneName,
+        slots,
+        updated_at: new Date().toISOString(),
+      }]),
+    });
+    const row = firstRow(rows) || {};
+    return res.json({
+      ok: true,
+      preference: {
+        daily_enabled: Boolean(row.daily_enabled),
+        timezone_name: normalizeTimezoneName(row.timezone_name),
+        slots: normalizeDailyNotificationSlots(row.slots),
+        updated_at: row.updated_at || null,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: error?.message || "Gagal menyimpan preferensi notifikasi.",
+      hint: "Pastikan tabel user_notification_preferences sudah dibuat di Supabase.",
+    });
+  }
+});
+
 app.post("/api/push/token", requireSupabaseUser, async (req, res) => {
   try {
     const userId = String(req.authUser.id);
@@ -3902,6 +4035,145 @@ app.post("/api/push/chat/broadcast", async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ error: error?.message || "Gagal broadcast push chat." });
+  }
+});
+
+const shouldSkipDeliveredDailyNotification = async ({ userId, deviceId, slotName, deliveryDate }) => {
+  const rows = await supabaseRestFetch(
+    `${NOTIFICATION_DELIVERY_LOG_TABLE}?user_id=eq.${encodeURIComponent(userId)}&device_id=eq.${encodeURIComponent(deviceId)}&slot=eq.${encodeURIComponent(slotName)}&delivery_date=eq.${encodeURIComponent(deliveryDate)}&select=id,status&limit=1`
+  ).catch(() => null);
+  const row = firstRow(rows);
+  return Boolean(row && row.status === "sent");
+};
+
+const writeDailyNotificationLog = async ({ userId, deviceId, slotName, deliveryDate, status, errorMessage = "" }) => {
+  return supabaseRestFetch(`${NOTIFICATION_DELIVERY_LOG_TABLE}?on_conflict=user_id,device_id,slot,delivery_date&select=*`, {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: JSON.stringify([{
+      user_id: userId,
+      device_id: deviceId,
+      slot: slotName,
+      delivery_date: deliveryDate,
+      status,
+      error_message: errorMessage ? String(errorMessage).slice(0, 500) : null,
+      sent_at: status === "sent" ? new Date().toISOString() : null,
+      updated_at: new Date().toISOString(),
+    }]),
+  }).catch((error) => {
+    console.warn("[daily-notification] failed writing log:", error?.message);
+    return null;
+  });
+};
+
+const runDailyNotificationSchedulerTick = async (now = new Date()) => {
+  const preferences = await supabaseRestFetch(
+    `${NOTIFICATION_PREF_TABLE}?daily_enabled=eq.true&select=user_id,daily_enabled,timezone_name,slots&limit=1000`
+  );
+  const rows = Array.isArray(preferences) ? preferences : [];
+  const messages = await readNotificationMessages();
+  let sent = 0;
+  let skipped = 0;
+  let failed = 0;
+
+  for (const preference of rows) {
+    const userId = toSafeTrimmed(preference?.user_id);
+    if (!userId) {
+      skipped += 1;
+      continue;
+    }
+
+    const dueSlots = dueNotificationSlotsForPreference(preference, now);
+    if (!dueSlots.length) {
+      skipped += 1;
+      continue;
+    }
+
+    const tokenRows = await supabaseRestFetch(
+      `${DEVICE_TOKEN_TABLE}?user_id=eq.${encodeURIComponent(userId)}&platform=eq.android&select=id,device_id,fcm_token,updated_at&order=updated_at.desc&limit=10`
+    ).catch(() => []);
+    const devices = Array.isArray(tokenRows) ? tokenRows : [];
+    if (!devices.length) {
+      skipped += dueSlots.length;
+      continue;
+    }
+
+    for (const slot of dueSlots) {
+      const messageText = pickNotificationMessage(messages, slot.name);
+      for (const device of devices) {
+        const fcmToken = toSafeTrimmed(device?.fcm_token);
+        const deviceId = toSafeTrimmed(device?.device_id) || String(device?.id || "unknown-device");
+        if (!fcmToken) {
+          skipped += 1;
+          continue;
+        }
+
+        const alreadySent = await shouldSkipDeliveredDailyNotification({
+          userId,
+          deviceId,
+          slotName: slot.name,
+          deliveryDate: slot.deliveryDate,
+        });
+        if (alreadySent) {
+          skipped += 1;
+          continue;
+        }
+
+        try {
+          await sendFcmDataMessage({
+            token: fcmToken,
+            data: {
+              conversationId: `daily_${slot.name}`,
+              messageId: `daily_${slot.name}_${slot.deliveryDate}_${Date.now()}`,
+              senderName: slot.config.title,
+              messageText,
+              timestamp: String(Date.now()),
+              avatarUrl: "",
+              source: "dompetku_daily",
+              slot: slot.name,
+              deliveryDate: slot.deliveryDate,
+              timezoneName: slot.timezoneName,
+            },
+          });
+          await writeDailyNotificationLog({
+            userId,
+            deviceId,
+            slotName: slot.name,
+            deliveryDate: slot.deliveryDate,
+            status: "sent",
+          });
+          sent += 1;
+        } catch (error) {
+          failed += 1;
+          await writeDailyNotificationLog({
+            userId,
+            deviceId,
+            slotName: slot.name,
+            deliveryDate: slot.deliveryDate,
+            status: "failed",
+            errorMessage: error?.message || "send_failed",
+          });
+          console.warn("[daily-notification] send failed:", userId, slot.name, error?.message);
+        }
+      }
+    }
+  }
+
+  return { ok: true, checked: rows.length, sent, skipped, failed, now: now.toISOString() };
+};
+
+app.post("/api/notifications/daily/send-due", async (req, res) => {
+  try {
+    if (!assertInternalApiKey(req)) {
+      return res.status(401).json({ error: "Internal API key tidak valid." });
+    }
+    const forcedNow = req.body?.now ? new Date(req.body.now) : new Date();
+    const now = Number.isNaN(forcedNow.getTime()) ? new Date() : forcedNow;
+    const result = await runDailyNotificationSchedulerTick(now);
+    return res.json(result);
+  } catch (error) {
+    console.error("[daily-notification] scheduler failed:", error);
+    return res.status(500).json({ error: error?.message || "Gagal menjalankan scheduler notifikasi harian." });
   }
 });
 
