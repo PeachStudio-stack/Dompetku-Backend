@@ -2222,7 +2222,6 @@ const streamOpenRouterText = async (params) => {
   };
 };
 
-const toYmd = (date) => date.toISOString().slice(0, 10);
 const parseYmd = (value) => {
   if (!value) return null;
   const v = String(value).trim();
@@ -2378,22 +2377,6 @@ const computeNextRunUtc = (rule, fromDate) => {
     if (candidateUtc.getTime() >= fromDate.getTime() - 1_000) return candidateUtc;
   }
   return null;
-};
-
-const syncSnapshotFinance = (accountingData, tx) => {
-  const next = { ...(accountingData || {}) };
-  next.transactions = Array.isArray(next.transactions) ? [...next.transactions, tx] : [tx];
-  next.expenses = isObject(next.expenses) ? { ...next.expenses } : {};
-  next.expenses[tx.category] = Number(next.expenses[tx.category] || 0) + Number(tx.amount || 0);
-  next.wallets = isObject(next.wallets) ? { ...next.wallets } : {};
-  if (!next.wallets[tx.account]) {
-    next.wallets[tx.account] = { type: "Lainnya", startingBalance: 0, currentBalance: 0 };
-  }
-  next.wallets[tx.account] = {
-    ...next.wallets[tx.account],
-    currentBalance: Number(next.wallets[tx.account].currentBalance || 0) - Number(tx.amount || 0),
-  };
-  return next;
 };
 
 const normalizeName = (value) => {
@@ -3288,25 +3271,6 @@ const readUserBootstrapData = async (userId) => {
   };
 };
 
-const insertRecurringRun = async (payload, onConflict = "ignore") => {
-  try {
-    const data = await supabaseRestFetch(`${RECURRING_RUN_TABLE}?on_conflict=rule_id,scheduled_for_utc`, {
-      method: "POST",
-      headers: {
-        Prefer:
-          onConflict === "ignore"
-            ? "resolution=ignore-duplicates,return=representation"
-            : "return=representation",
-      },
-      body: JSON.stringify([payload]),
-    });
-    return Array.isArray(data) ? data[0] : data;
-  } catch (error) {
-    if (onConflict === "ignore" && /duplicate|23505/i.test(String(error?.message || ""))) return null;
-    throw error;
-  }
-};
-
 const updateRecurringRuleRow = async (ruleId, patch) => {
   const payload = { ...patch, updated_at: new Date().toISOString() };
   const data = await supabaseRestFetch(`${RECURRING_RULE_TABLE}?id=eq.${encodeURIComponent(ruleId)}&select=*`, {
@@ -3315,179 +3279,6 @@ const updateRecurringRuleRow = async (ruleId, patch) => {
     body: JSON.stringify(payload),
   });
   return Array.isArray(data) ? data[0] : data;
-};
-
-const buildRecurringTransaction = (rule, scheduledFor, resolvedAccount) => ({
-  id: `rtx_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-  date: toYmd(scheduledFor),
-  description: rule.description || `Auto ${rule.category}`,
-  amount: Number(rule.amount) || 0,
-  type: rule.tx_type || "expense",
-  category: rule.category || "Lainnya",
-  account: resolvedAccount || rule.account_name || DEFAULT_ACCOUNT_NAME,
-  note: `[AUTO:${rule.id}] ${rule.description || ""}`.trim(),
-  source: "recurring_rule",
-  method: rule.method || "Auto",
-});
-
-const runRecurringRuleOnce = async (rule, now) => {
-  const scheduledAt = new Date(rule.next_run_at_utc || now.toISOString());
-  const runMarker = await insertRecurringRun(
-    {
-      rule_id: rule.id,
-      user_id: rule.user_id,
-      scheduled_for_utc: scheduledAt.toISOString(),
-      executed_at_utc: now.toISOString(),
-      status: "failed",
-      reason: "processing",
-    },
-    "ignore"
-  );
-  if (!runMarker) return { processed: false, nextRun: null };
-
-  try {
-    const rows = await supabaseRestFetch(
-      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(rule.user_id)}&select=user_id,accounting_data,data_version`
-    );
-    const snapshot = Array.isArray(rows) ? rows[0] : rows;
-    const accountingData = isObject(snapshot?.accounting_data) ? snapshot.accounting_data : {};
-    const wallets = accountingData?.wallets || {};
-    const walletKeys = Object.keys(wallets);
-    // Smart wallet resolution: fallback to first available wallet if rule's account_name doesn't exist
-    const preferredWallet = rule.account_name || DEFAULT_ACCOUNT_NAME;
-    const resolvedWalletName = wallets[preferredWallet]
-      ? preferredWallet
-      : walletKeys.length > 0
-        ? walletKeys[0]
-        : preferredWallet;
-    const walletBalance = Number(wallets[resolvedWalletName]?.currentBalance || 0);
-    const amount = Number(rule.amount) || 0;
-
-    if (rule.tx_type !== "income" && walletBalance < amount) {
-      await supabaseRestFetch(`${RECURRING_RUN_TABLE}?id=eq.${encodeURIComponent(String(runMarker.id))}`, {
-        method: "PATCH",
-        body: JSON.stringify({
-          status: "skipped",
-          reason: "skipped_insufficient_balance",
-          executed_at_utc: new Date().toISOString(),
-          snapshot_version: Number(snapshot?.data_version || 0),
-        }),
-      });
-      const nextRun = computeNextRunUtc(rule, new Date(scheduledAt.getTime() + 60_000));
-      return { processed: true, nextRun };
-    }
-
-    const tx = buildRecurringTransaction(rule, scheduledAt, resolvedWalletName);
-    const synced = syncSnapshotFinance(accountingData, tx);
-    const nextVersion = Date.now();
-    await supabaseRestFetch(`${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(rule.user_id)}`, {
-      method: "PATCH",
-      body: JSON.stringify({
-        accounting_data: synced,
-        data_version: nextVersion,
-        updated_at: new Date().toISOString(),
-      }),
-    });
-    await supabaseRestFetch(`${RECURRING_RUN_TABLE}?id=eq.${encodeURIComponent(String(runMarker.id))}`, {
-      method: "PATCH",
-      body: JSON.stringify({
-        status: "success",
-        reason: "executed",
-        transaction_id: String(tx.id),
-        snapshot_version: nextVersion,
-        executed_at_utc: new Date().toISOString(),
-      }),
-    });
-
-    try {
-      const tokenRows = await supabaseRestFetch(
-        `${DEVICE_TOKEN_TABLE}?user_id=eq.${encodeURIComponent(rule.user_id)}&platform=eq.android&select=fcm_token,updated_at&order=updated_at.desc&limit=1`
-      ).catch(() => null);
-      const fcmToken = toSafeTrimmed(firstRow(tokenRows)?.fcm_token);
-      if (fcmToken) {
-        const rupiah = (val) => "Rp" + Math.round(val || 0).toLocaleString("id-ID");
-        const detail = [
-          rule.description || rule.category || 'Transaksi otomatis',
-          Number(rule.amount || 0) > 0 ? rupiah(Number(rule.amount || 0)) : '',
-        ].filter(Boolean).join(' - ');
-
-        await sendFcmDataMessage({
-          token: fcmToken,
-          data: {
-            conversationId: "recurring_run",
-            messageId: `recurring_${runMarker.id}_${Date.now()}`,
-            senderName: "Dompetku",
-            messageText: `Transaksi otomatis tercatat: ${detail}`,
-            timestamp: String(Date.now()),
-            avatarUrl: "",
-          }
-        }).catch((err) => console.error("[recurring-push] failed to send push:", err.message));
-      }
-    } catch (pushErr) {
-      console.error("[recurring-push] FCM query/send failed:", pushErr.message);
-    }
-
-    const nextRun = computeNextRunUtc(rule, new Date(scheduledAt.getTime() + 60_000));
-    return { processed: true, nextRun };
-  } catch (error) {
-    await supabaseRestFetch(`${RECURRING_RUN_TABLE}?id=eq.${encodeURIComponent(String(runMarker.id))}`, {
-      method: "PATCH",
-      body: JSON.stringify({
-        status: "failed",
-        reason: String(error?.message || "unknown_error").slice(0, 200),
-        executed_at_utc: new Date().toISOString(),
-      }),
-    });
-    throw error;
-  }
-};
-
-const processRecurringRuleCatchup = async (rule, now) => {
-  let currentRule = { ...rule };
-  const autoAccess = await resolveAutoTransactionAccess(currentRule.user_id);
-  if (!autoAccess.ok) {
-    const nextRun = computeNextRunUtc(currentRule, new Date(now.getTime() + 60_000));
-    await updateRecurringRuleRow(currentRule.id, {
-      next_run_at_utc: nextRun ? nextRun.toISOString() : null,
-      is_active: Boolean(nextRun) && currentRule.is_active,
-    });
-    return;
-  }
-  let safety = 0;
-  while (
-    currentRule.is_active &&
-    currentRule.next_run_at_utc &&
-    new Date(currentRule.next_run_at_utc).getTime() <= now.getTime() &&
-    safety < 365
-  ) {
-    safety += 1;
-    const { processed, nextRun } = await runRecurringRuleOnce(currentRule, now);
-    if (!processed) break;
-    currentRule.next_run_at_utc = nextRun ? nextRun.toISOString() : null;
-    if (!currentRule.next_run_at_utc) {
-      currentRule.is_active = false;
-      break;
-    }
-  }
-  await updateRecurringRuleRow(currentRule.id, {
-    next_run_at_utc: currentRule.next_run_at_utc,
-    is_active: currentRule.is_active,
-  });
-};
-
-const runRecurringSchedulerTick = async () => {
-  const now = new Date();
-  const dueRules = await supabaseRestFetch(
-    `${RECURRING_RULE_TABLE}?is_active=eq.true&next_run_at_utc=lte.${encodeURIComponent(now.toISOString())}&order=next_run_at_utc.asc&limit=200`
-  );
-  const rows = Array.isArray(dueRules) ? dueRules : [];
-  for (const raw of rows) {
-    try {
-      await processRecurringRuleCatchup(raw, now);
-    } catch (error) {
-      console.error("[recurring] tick rule failed", raw?.id, error);
-    }
-  }
 };
 
 app.set("trust proxy", TRUST_PROXY);
@@ -6059,9 +5850,9 @@ app.post("/api/subscription/cancel", requireSupabaseUser, async (req, res) => {
   }
 });
 
-// Local node-based recurring scheduler is disabled because the scheduler has been migrated 
-// to a Supabase Deno Edge Function ('recurring-scheduler') triggered by pg_cron.
-console.info("[recurring] local node-based scheduler disabled (migrated to Supabase Edge Function & pg_cron).");
+// Recurring execution lives only in the Supabase Deno Edge Function ('recurring-scheduler').
+// BackendOnly keeps rule/run API access for the app UI, but never creates automatic transactions.
+console.info("[recurring] BackendOnly recurring executor removed; using Supabase Edge Function only.");
 
 
 app.listen(PORT, "0.0.0.0", () => {
