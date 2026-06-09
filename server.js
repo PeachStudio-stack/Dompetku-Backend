@@ -5689,6 +5689,60 @@ app.post("/api/promocodes/redeem", requireSupabaseUser, async (req, res) => {
   }
 });
 
+const mapReferralError = (errMessage) => {
+  const msg = String(errMessage || "");
+  if (msg.includes("REFERRAL_CODE_EMPTY")) return "REFERRAL_CODE_EMPTY";
+  if (msg.includes("USER_PROFILE_NOT_FOUND")) return "USER_PROFILE_NOT_FOUND";
+  if (msg.includes("ALREADY_REDEEMED_REFERRAL")) return "ALREADY_REDEEMED_REFERRAL";
+  if (msg.includes("REFERRAL_CODE_NOT_FOUND")) return "REFERRAL_CODE_NOT_FOUND";
+  if (msg.includes("CANNOT_REFER_SELF")) return "CANNOT_REFER_SELF";
+  return "REFERRAL_UNKNOWN_ERROR";
+};
+
+const getReferralUserFacingMessage = (code) => {
+  switch (code) {
+    case "REFERRAL_CODE_EMPTY": return "Kode referral tidak boleh kosong.";
+    case "USER_PROFILE_NOT_FOUND": return "Profil pengguna tidak ditemukan.";
+    case "ALREADY_REDEEMED_REFERRAL": return "Anda sudah pernah memasukkan kode referral.";
+    case "REFERRAL_CODE_NOT_FOUND": return "Kode referral tidak valid / tidak ditemukan.";
+    case "CANNOT_REFER_SELF": return "Anda tidak bisa menggunakan kode referral Anda sendiri.";
+    default: return "Gagal memproses kode referral. Silakan coba lagi.";
+  }
+};
+
+app.post("/api/referrals/submit", requireSupabaseUser, async (req, res) => {
+  try {
+    if (!SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(503).json({ error: "Service referral belum dikonfigurasi di server." });
+    }
+    const userId = req.authUser?.id;
+    const code = String(req.body?.code || "").trim().toUpperCase();
+    if (!code) return res.status(400).json({ error: "Kode referral wajib diisi.", errorCode: "REFERRAL_CODE_EMPTY" });
+
+    const result = await supabaseRestFetch("rpc/submit_referral_code", {
+      method: "POST",
+      body: JSON.stringify({ p_user_id: userId, p_code: code }),
+    });
+    const payload = firstRow(result) || result;
+    return res.json({
+      ok: true,
+      referredBy: payload?.referred_by || null,
+      referredByCode: payload?.referred_by_code || null,
+      rewardDetails: payload?.reward_details || null,
+      message: "Kode referral berhasil diterapkan.",
+    });
+  } catch (error) {
+    const message = String(error?.message || "");
+    const errorCode = mapReferralError(message);
+    const status = errorCode === "REFERRAL_CODE_NOT_FOUND" ? 404 : 400;
+    return res.status(status).json({
+      ok: false,
+      error: getReferralUserFacingMessage(errorCode),
+      errorCode,
+    });
+  }
+});
+
 app.post("/api/iap/google/verify", async (req, res) => {
   try {
     const { userId, plan, productId, purchaseToken } = req.body || {};
