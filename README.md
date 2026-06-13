@@ -32,8 +32,9 @@ Wajib isi:
 - `SUPABASE_URL`
 - `SUPABASE_PUBLISHABLE_KEY`
 - `SUPABASE_SERVICE_ROLE_KEY`
-- `OPENROUTER_MODEL_FREE=deepseek/deepseek-v4-flash:free`
-- `OPENROUTER_MODEL_REPORT_RECOMMENDATION=deepseek/deepseek-v4-flash:free`
+- `OPENROUTER_MODEL_PAID=minimax/minimax-m3`
+- `OPENROUTER_MODEL_FREE=deepseek/deepseek-v4-flash`
+- `OPENROUTER_MODEL_REPORT_RECOMMENDATION=deepseek/deepseek-v4-flash`
 - `CORS_ALLOWED_ORIGINS` (domain frontend kamu + origin Capacitor: `http://localhost`, `https://localhost`, `capacitor://localhost`)
 - `FIREBASE_PROJECT_ID` (untuk FCM HTTP v1 push notifikasi)
 - `GOOGLE_SERVICE_ACCOUNT_JSON` atau kombinasi `GOOGLE_SERVICE_ACCOUNT_EMAIL` + `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY`
@@ -45,9 +46,11 @@ Contoh:
 NODE_ENV=production
 PORT=3000
 OPENROUTER_API_KEY=sk-or-v1-xxxx
-OPENROUTER_MODEL_FREE=deepseek/deepseek-v4-flash:free
-OPENROUTER_MODEL_REPORT_RECOMMENDATION=deepseek/deepseek-v4-flash:free
-OPENROUTER_MODEL_QUICK_SUGGEST=deepseek/deepseek-v4-flash:free
+OPENROUTER_MODEL_PAID=minimax/minimax-m3
+OPENROUTER_MODEL_FREE=deepseek/deepseek-v4-flash
+OPENROUTER_MODEL_REPORT_RECOMMENDATION=deepseek/deepseek-v4-flash
+OPENROUTER_MODEL_QUICK_SUGGEST=deepseek/deepseek-v4-flash
+MAX_CHAT_VIDEO_SECONDS=7
 SUPABASE_URL=https://your-project-ref.supabase.co
 SUPABASE_PUBLISHABLE_KEY=sb_publishable_xxx
 SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
