@@ -35,6 +35,10 @@ const OPENROUTER_MODEL_VISION_FREE =
   process.env.OPENROUTER_MODEL_VISION_FREE || "google/gemini-2.5-flash:free";
 const OPENROUTER_MODEL_VISION_PAID =
   process.env.OPENROUTER_MODEL_VISION_PAID || "google/gemini-2.5-flash";
+const OPENROUTER_MODEL_ACTIONS_FREE =
+  process.env.OPENROUTER_MODEL_ACTIONS_FREE || "google/gemini-2.5-flash:free";
+const OPENROUTER_MODEL_ACTIONS_PAID =
+  process.env.OPENROUTER_MODEL_ACTIONS_PAID || "google/gemini-2.5-flash";
 const OPENROUTER_TIMEOUT_FREE_MS = Number(process.env.OPENROUTER_TIMEOUT_FREE_MS || process.env.OPENROUTER_TIMEOUT_FAST_MS || 12000);
 const OPENROUTER_TIMEOUT_PAID_MS = Number(process.env.OPENROUTER_TIMEOUT_PAID_MS || process.env.OPENROUTER_TIMEOUT_HEAVY_MS || 25000);
 const MAX_CHAT_ATTACHMENT_BYTES = Math.min(
@@ -1566,7 +1570,10 @@ const resolveAiRouteModelPolicy = ({ route, prompt, accessPlan, hasAttachments }
   let freeModel = sanitizeModelId(OPENROUTER_MODEL_FREE, DEFAULT_FREE_MODEL);
   let paidModel = sanitizePaidModelId(OPENROUTER_MODEL_PAID, DEFAULT_PAID_MODEL, "OPENROUTER_MODEL_PAID");
 
-  if (hasAttachments) {
+  if (route === "agent_actions") {
+    freeModel = sanitizeModelId(OPENROUTER_MODEL_ACTIONS_FREE, "google/gemini-2.5-flash:free");
+    paidModel = sanitizePaidModelId(OPENROUTER_MODEL_ACTIONS_PAID, "google/gemini-2.5-flash", "OPENROUTER_MODEL_ACTIONS_PAID");
+  } else if (hasAttachments) {
     freeModel = sanitizeModelId(OPENROUTER_MODEL_VISION_FREE, "google/gemini-2.5-flash:free");
     paidModel = sanitizePaidModelId(OPENROUTER_MODEL_VISION_PAID, "google/gemini-2.5-flash", "OPENROUTER_MODEL_VISION_PAID");
   }
@@ -1644,6 +1651,7 @@ const resolveAccessModelPlan = (prompt, accessPlan) => {
 
 // Startup guard rails for paid model configuration.
 sanitizePaidModelId(OPENROUTER_MODEL_PAID, DEFAULT_PAID_MODEL, "OPENROUTER_MODEL_PAID");
+sanitizePaidModelId(OPENROUTER_MODEL_ACTIONS_PAID, "google/gemini-2.5-flash", "OPENROUTER_MODEL_ACTIONS_PAID");
 
 const compactObject = (obj = {}) =>
   Object.fromEntries(Object.entries(obj).filter(([, value]) => Number(value) !== 0));
@@ -3657,6 +3665,102 @@ const normalizeAccountingData = (input) => {
   return normalized;
 };
 
+const mergeAccountingDataServerSide = (local, remote) => {
+  if (!remote) return local;
+
+  const localTxs = Array.isArray(local.transactions) ? local.transactions : [];
+  const remoteTxs = Array.isArray(remote.transactions) ? remote.transactions : [];
+  const txMap = new Map();
+
+  // Populate map with remote transactions
+  remoteTxs.forEach((tx) => {
+    if (tx && tx.id) txMap.set(String(tx.id), tx);
+  });
+
+  // Overlay with local transactions (overwrites or appends)
+  localTxs.forEach((tx) => {
+    if (tx && tx.id) {
+      txMap.set(String(tx.id), tx);
+    }
+  });
+
+  const mergedTransactions = Array.from(txMap.values());
+
+  // Sort transactions (day-level descending, then priority, then createdAt descending)
+  mergedTransactions.sort((a, b) => {
+    const dayA = String(a.date || "").slice(0, 10);
+    const dayB = String(b.date || "").slice(0, 10);
+    if (dayA !== dayB) {
+      return dayB.localeCompare(dayA);
+    }
+
+    const isAutoOrAgent = (tx) => {
+      const isAuto = tx.source === "recurring_rule" || tx.id?.startsWith("rtx_") || String(tx.note || "").includes("[AUTO:");
+      const isAgent = tx.source === "agent" || tx.source === "chat" || tx.id?.startsWith("tx_agent_");
+      return isAuto || isAgent;
+    };
+
+    const isAutoOrAgentA = isAutoOrAgent(a);
+    const isAutoOrAgentB = isAutoOrAgent(b);
+    if (isAutoOrAgentA !== isAutoOrAgentB) {
+      return isAutoOrAgentA ? -1 : 1;
+    }
+
+    const timeA = new Date(a.createdAt || a.created_at || a.date || 0).getTime();
+    const timeB = new Date(b.createdAt || b.created_at || b.date || 0).getTime();
+    if (timeA !== timeB) return timeB - timeA;
+    return String(b.id || "").localeCompare(String(a.id || ""));
+  });
+
+  const mergedWallets = { ...(remote.wallets || {}), ...(local.wallets || {}) };
+
+  const mergedBudgets = { ...(remote.budgets || {}) };
+  for (const [name, localBudget] of Object.entries(local.budgets || {})) {
+    const remoteBudget = mergedBudgets[name];
+    if (!remoteBudget) {
+      mergedBudgets[name] = localBudget;
+    } else {
+      mergedBudgets[name] = {
+        limit: localBudget.limit !== 1500000 || remoteBudget.limit === 1500000 ? localBudget.limit : remoteBudget.limit,
+        spent: Math.max(localBudget.spent || 0, remoteBudget.spent || 0),
+        note: localBudget.note || remoteBudget.note,
+        updatedAt: localBudget.updatedAt || remoteBudget.updatedAt,
+      };
+    }
+  }
+
+  const mergedTabunganPlans = { ...(remote.tabunganPlans || {}) };
+  for (const [name, localPlan] of Object.entries(local.tabunganPlans || {})) {
+    const remotePlan = mergedTabunganPlans[name];
+    if (!remotePlan) {
+      mergedTabunganPlans[name] = localPlan;
+    } else {
+      mergedTabunganPlans[name] = {
+        target: Math.max(localPlan.target || 0, remotePlan.target || 0),
+        current: Math.max(localPlan.current || 0, remotePlan.current || 0),
+        note: localPlan.note || remotePlan.note,
+        createdAt: localPlan.createdAt || remotePlan.createdAt,
+        updatedAt: localPlan.updatedAt || remotePlan.updatedAt,
+      };
+    }
+  }
+
+  let next = {
+    ...local,
+    wallets: mergedWallets,
+    budgets: mergedBudgets,
+    tabunganPlans: mergedTabunganPlans,
+    transactions: mergedTransactions,
+  };
+
+  next = normalizeAccountingDataServerSide(next);
+  next = syncAccounts(next);
+  next = syncWalletsWithTransactions(next);
+  next = syncBudgetsWithTransactions(next);
+  return next;
+};
+
+
 const sortUnique = (values) =>
   Array.from(new Set((Array.isArray(values) ? values : []).map((v) => String(v || "").trim()).filter(Boolean))).sort((a, b) =>
     a.localeCompare(b, "id")
@@ -3852,6 +3956,8 @@ app.get("/health", (_req, res) => {
       paid: OPENROUTER_MODEL_PAID,
       free: OPENROUTER_MODEL_FREE,
       report: OPENROUTER_MODEL_REPORT_RECOMMENDATION,
+      actionsPaid: OPENROUTER_MODEL_ACTIONS_PAID,
+      actionsFree: OPENROUTER_MODEL_ACTIONS_FREE,
     },
   });
 });
@@ -3864,6 +3970,8 @@ app.get("/api/health/ai", (_req, res) => {
     modelFree: OPENROUTER_MODEL_FREE,
     modelReport: OPENROUTER_MODEL_REPORT_RECOMMENDATION,
     modelQuickSuggest: OPENROUTER_MODEL_QUICK_SUGGEST,
+    modelActionsPaid: OPENROUTER_MODEL_ACTIONS_PAID,
+    modelActionsFree: OPENROUTER_MODEL_ACTIONS_FREE,
     nodeEnv: process.env.NODE_ENV || "development",
   });
 });
@@ -4429,23 +4537,31 @@ app.put("/api/accounting-snapshot", requireSupabaseUser, async (req, res) => {
     const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
     const accountingData = normalizeAccountingData(req.body?.accountingData || req.body?.accounting_data || {});
 
+    // Fetch existing snapshot to merge transactions and prevent background updates loss
+    const oldRows = await supabaseRestFetch(
+      `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&select=accounting_data`
+    ).catch(() => null);
+    const oldSnapshot = firstRow(oldRows)?.accounting_data || null;
+
     // Enforce permissions for family members
     if (familyCtx.inFamily && !familyCtx.isOwner) {
-      const oldRows = await supabaseRestFetch(
-        `${FINANCE_TABLE}?user_id=eq.${encodeURIComponent(targetUserId)}&select=accounting_data`
-      ).catch(() => null);
-      const oldSnapshot = firstRow(oldRows)?.accounting_data || {};
-      const validation = validateSnapshotPermissions(oldSnapshot, accountingData, familyCtx.permissions);
+      const oldSnapshotObj = oldSnapshot || {};
+      const validation = validateSnapshotPermissions(oldSnapshotObj, accountingData, familyCtx.permissions);
       if (!validation.ok) {
         return res.status(403).json({ error: validation.error });
       }
     }
 
+    let mergedData = accountingData;
+    if (oldSnapshot) {
+      mergedData = mergeAccountingDataServerSide(accountingData, oldSnapshot);
+    }
+
     await upsertMasterCategories(
       targetUserId,
-      collectCategorySeedsFromSnapshot(accountingData).map((item) => ({ ...item, source: "snapshot_sync" }))
+      collectCategorySeedsFromSnapshot(mergedData).map((item) => ({ ...item, source: "snapshot_sync" }))
     );
-    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(targetUserId, accountingData);
+    const { mirrored } = await ensureCategoryMasterAndMirrorSnapshot(targetUserId, mergedData);
     const dataVersion = Date.now();
     await supabaseRestFetch(`${FINANCE_TABLE}?on_conflict=user_id`, {
       method: "POST",
@@ -4464,6 +4580,7 @@ app.put("/api/accounting-snapshot", requireSupabaseUser, async (req, res) => {
     return res.status(500).json({ error: error?.message || "Failed to save accounting snapshot." });
   }
 });
+
 
 app.get("/api/categories", requireSupabaseUser, async (req, res) => {
   try {
