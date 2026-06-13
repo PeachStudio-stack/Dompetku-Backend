@@ -31,6 +31,10 @@ const OPENROUTER_MODEL_QUICK_SUGGEST =
 const OPENROUTER_MODEL_FREE = process.env.OPENROUTER_MODEL_FREE || "deepseek/deepseek-v4-flash";
 const OPENROUTER_MODEL_REPORT_RECOMMENDATION =
   process.env.OPENROUTER_MODEL_REPORT_RECOMMENDATION || "deepseek/deepseek-v4-flash";
+const OPENROUTER_MODEL_VISION_FREE =
+  process.env.OPENROUTER_MODEL_VISION_FREE || "google/gemini-2.5-flash:free";
+const OPENROUTER_MODEL_VISION_PAID =
+  process.env.OPENROUTER_MODEL_VISION_PAID || "google/gemini-2.5-flash";
 const OPENROUTER_TIMEOUT_FREE_MS = Number(process.env.OPENROUTER_TIMEOUT_FREE_MS || process.env.OPENROUTER_TIMEOUT_FAST_MS || 12000);
 const OPENROUTER_TIMEOUT_PAID_MS = Number(process.env.OPENROUTER_TIMEOUT_PAID_MS || process.env.OPENROUTER_TIMEOUT_HEAVY_MS || 25000);
 const MAX_CHAT_ATTACHMENT_BYTES = Math.min(
@@ -601,11 +605,14 @@ const getMediaLimitsForPlan = (accessPlan) => {
 
 const parseDataUrl = (value) => {
   const raw = String(value || "");
-  const match = raw.match(/^data:([^;,]+)(;base64)?,([\s\S]*)$/i);
-  if (!match) return null;
-  const mimeType = String(match[1] || "").toLowerCase();
-  const isBase64 = Boolean(match[2]);
-  const data = String(match[3] || "");
+  if (!raw.startsWith("data:")) return null;
+  const commaIdx = raw.indexOf(",");
+  if (commaIdx === -1) return null;
+  const meta = raw.slice(5, commaIdx);
+  const data = raw.slice(commaIdx + 1);
+  const parts = meta.split(";");
+  const mimeType = String(parts[0] || "").toLowerCase();
+  const isBase64 = parts.includes("base64");
   let buffer;
   try {
     buffer = isBase64 ? Buffer.from(data, "base64") : Buffer.from(decodeURIComponent(data), "utf8");
@@ -1552,12 +1559,17 @@ const uniqueModelChain = (models) => {
   return out;
 };
 
-const resolveAiRouteModelPolicy = ({ route, prompt, accessPlan }) => {
+const resolveAiRouteModelPolicy = ({ route, prompt, accessPlan, hasAttachments }) => {
   const base = resolveModelPlan(prompt || "");
   const normalizedAccessPlan = normalizeAccessPlan(accessPlan);
   const planTier = isFreeAccess(normalizedAccessPlan) ? "free" : "paid";
-  const freeModel = sanitizeModelId(OPENROUTER_MODEL_FREE, DEFAULT_FREE_MODEL);
-  const paidModel = sanitizePaidModelId(OPENROUTER_MODEL_PAID, DEFAULT_PAID_MODEL, "OPENROUTER_MODEL_PAID");
+  let freeModel = sanitizeModelId(OPENROUTER_MODEL_FREE, DEFAULT_FREE_MODEL);
+  let paidModel = sanitizePaidModelId(OPENROUTER_MODEL_PAID, DEFAULT_PAID_MODEL, "OPENROUTER_MODEL_PAID");
+
+  if (hasAttachments) {
+    freeModel = sanitizeModelId(OPENROUTER_MODEL_VISION_FREE, "google/gemini-2.5-flash:free");
+    paidModel = sanitizePaidModelId(OPENROUTER_MODEL_VISION_PAID, "google/gemini-2.5-flash", "OPENROUTER_MODEL_VISION_PAID");
+  }
 
   if (planTier === "free") {
     const modelFallbackChain = uniqueModelChain([freeModel]);
@@ -1883,6 +1895,27 @@ const getAiUserFacingMessage = (error) => {
     return getOpenRouterRateLimitMessage();
   }
   return String(error?.message || "Layanan AI sedang bermasalah. Coba lagi.");
+};
+
+const getMediaAiUserFacingMessage = (error) => {
+  const message = String(error?.message || "");
+  const status = Number(error?.status || 0);
+  if (status >= 400 && status < 500 && !/OpenRouter Error/i.test(message)) {
+    return message || "Media belum valid sebagai bukti transaksi.";
+  }
+  if (/request.*too.*large|payload.*too.*large|413|file.*too.*large|content.*too.*large/i.test(message)) {
+    return "Ukuran file terlalu besar untuk diproses AI. Coba kompres atau kirim gambar/video yang lebih kecil.";
+  }
+  if (/OpenRouter Error 400|OpenRouter Error 422|invalid.*image|invalid.*video|unsupported.*media|image_url|video_url|content parts/i.test(message)) {
+    return "Media belum bisa diproses oleh AI. Coba file yang lebih kecil/jelas, atau ketik transaksinya dulu.";
+  }
+  if (getAiErrorCode(error) !== "unknown") {
+    return getAiUserFacingMessage(error);
+  }
+  if (/OpenRouter Error|provider|fetch failed|network/i.test(message)) {
+    return "Media belum bisa diproses oleh AI. Coba lagi sebentar atau kirim bukti transaksi yang lebih jelas.";
+  }
+  return message || "Media belum valid sebagai bukti transaksi.";
 };
 
 const normalizeHealthStatus = (value) => {
@@ -5635,6 +5668,7 @@ app.post("/api/chat", async (req, res) => {
       route: "chat",
       prompt: prompt || "",
       accessPlan,
+      hasAttachments: attachments.length > 0,
     });
     let mediaPreflight = null;
     if (attachments.length) {
@@ -5649,7 +5683,9 @@ app.post("/api/chat", async (req, res) => {
         });
         mediaUsage = await assertChatMediaAccessAndUsage({ userId: authUserId, accessPlan, attachments });
       } catch (error) {
-        return res.status(error?.status || 422).json({ error: error?.message || "Media belum valid sebagai bukti transaksi." });
+        return res.status(error?.status || (getAiErrorCode(error) === "unknown" ? 422 : 502)).json({
+          error: getMediaAiUserFacingMessage(error),
+        });
       }
 
       if (String(req.body?.agentMode || "").toLowerCase() === "transaction" && mediaPreflight.actions.length) {
@@ -5841,6 +5877,7 @@ app.post("/api/chat/stream", async (req, res) => {
       route: "chat_stream",
       prompt: prompt || "",
       accessPlan,
+      hasAttachments: attachments.length > 0,
     });
     if (attachments.length) {
       try {
@@ -5854,7 +5891,9 @@ app.post("/api/chat/stream", async (req, res) => {
         });
         mediaUsage = await assertChatMediaAccessAndUsage({ userId: authUserId, accessPlan, attachments });
       } catch (error) {
-        res.status(error?.status || 422).json({ error: error?.message || "Media belum valid sebagai bukti transaksi." });
+        res.status(error?.status || (getAiErrorCode(error) === "unknown" ? 422 : 502)).json({
+          error: getMediaAiUserFacingMessage(error),
+        });
         return;
       }
     }
