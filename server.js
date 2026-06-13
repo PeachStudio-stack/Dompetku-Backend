@@ -1571,6 +1571,13 @@ const resolveAiRouteModelPolicy = ({ route, prompt, accessPlan, hasAttachments }
     paidModel = sanitizePaidModelId(OPENROUTER_MODEL_VISION_PAID, "google/gemini-2.5-flash", "OPENROUTER_MODEL_VISION_PAID");
   }
 
+  let maxTokens = 500;
+  if (normalizedAccessPlan === "starter") {
+    maxTokens = 1000;
+  } else if (normalizedAccessPlan === "personal" || normalizedAccessPlan === "admin") {
+    maxTokens = 2000;
+  }
+
   if (planTier === "free") {
     const modelFallbackChain = uniqueModelChain([freeModel]);
     return {
@@ -1581,7 +1588,7 @@ const resolveAiRouteModelPolicy = ({ route, prompt, accessPlan, hasAttachments }
       modelFallbackChain,
       primaryTimeout: OPENROUTER_TIMEOUT_FREE_MS,
       secondaryTimeout: OPENROUTER_TIMEOUT_FREE_MS,
-      maxTokens: base.maxTokens,
+      maxTokens,
     };
   }
 
@@ -1595,7 +1602,7 @@ const resolveAiRouteModelPolicy = ({ route, prompt, accessPlan, hasAttachments }
     modelFallbackChain,
     primaryTimeout: base.primaryTimeout,
     secondaryTimeout: base.secondaryTimeout,
-    maxTokens: base.maxTokens,
+    maxTokens,
   };
 };
 
@@ -1678,7 +1685,18 @@ const buildCompactData = (currentData) => ({
     : [],
 });
 
-const buildSystemInstruction = (targetLanguage, compactData) => `You are an AI personal finance assistant for everyday users age 18-28.
+const buildSystemInstruction = (targetLanguage, compactData, accessPlan) => {
+  const plan = normalizeAccessPlan(accessPlan);
+  let brevityRule = "";
+  if (plan === "free") {
+    brevityRule = "10) IMPORTANT: Keep your response extremely brief, short, and concise (maximum 2-3 sentences or a short list). Do not provide extensive explanations. Offer clear lists when summarizing transactions.";
+  } else if (plan === "starter") {
+    brevityRule = "10) IMPORTANT: Keep your response relatively brief and structured (maximum 150-200 words). Use clean lists where appropriate.";
+  } else {
+    brevityRule = "10) IMPORTANT: Provide detailed, rich, and comprehensive answers. Use structured lists, clear tables, and deep insights.";
+  }
+
+  return `You are an AI personal finance assistant for everyday users age 18-28.
 Rules:
 1) Only answer personal finance context: income, expenses, savings, debts, assets, budget, goals.
 2) Use simple everyday language, not business accounting jargon.
@@ -1689,8 +1707,11 @@ Rules:
 7) Do not output JSON patch blocks. Reply in natural language only.
 8) For media inputs, only discuss financial evidence that is visible in receipts, invoices, bank mutations, transfer proofs, payment screens, or similar transaction documents. Reject non-financial/random media politely.
 9) Refuse pornographic, sexually explicit, nude, or exploitative media and do not describe sexual details.
+${brevityRule}
+
 Compact context:
 ${JSON.stringify(compactData)}`;
+};
 
 const buildActionSystemInstruction = (targetLanguage, compactData) => `You are a personal-finance action planner.
 Return tool calls only for state-changing intent. Do not output JSON patch text.
@@ -5734,7 +5755,7 @@ app.post("/api/chat", async (req, res) => {
       model_fallback_chain: modelPolicy.fallbackModels,
     });
     const compactData = buildCompactData(currentData || {});
-    const systemInstruction = buildSystemInstruction(targetLanguage, compactData);
+    const systemInstruction = buildSystemInstruction(targetLanguage, compactData, accessPlan);
     const messages = buildOpenRouterMessages(
       systemInstruction,
       req.body.history,
@@ -5909,7 +5930,7 @@ app.post("/api/chat/stream", async (req, res) => {
       model_fallback_chain: modelPolicy.fallbackModels,
     });
     const compactData = buildCompactData(currentData || {});
-    const systemInstruction = buildSystemInstruction(targetLanguage, compactData);
+    const systemInstruction = buildSystemInstruction(targetLanguage, compactData, accessPlan);
     const messages = buildOpenRouterMessages(
       systemInstruction,
       req.body.history,
