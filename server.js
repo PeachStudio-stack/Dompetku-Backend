@@ -3116,7 +3116,7 @@ const makeTxFromArgs = (data, args, existing) => {
   const txType = args.type || existing?.type;
   if (!txType) return null;
   const amountRaw = (args.amount !== undefined || args.jumlah !== undefined) ? parseAmount(args.amount) || parseAmount(args.jumlah) : Number(existing?.amount || 0);
-  const amount = amountRaw > 0 ? amountRaw : 17000;
+  const amount = amountRaw > 0 ? amountRaw : 0;
   const walletName = resolveWalletName(data, args.account || existing?.account);
   ensureWalletExists(data, walletName);
   const baseCategory = normalizeName(args.category || args.kategori || existing?.category || "");
@@ -3174,7 +3174,7 @@ const executeAgentActionsServerSide = (currentData, actions) => {
 
     if (name === "addTabungan") {
       const planName = normalizeName(args.name);
-      const amount = parseAmount(args.amount) || parseAmount(args.jumlah) || 17000;
+      const amount = parseAmount(args.amount) || parseAmount(args.jumlah) || 0;
       if (!planName || amount <= 0) continue;
       const walletName = resolveWalletName(next, args.account);
       ensureWalletExists(next, walletName);
@@ -5287,7 +5287,8 @@ app.post("/api/agent/actions", async (req, res) => {
           toolChoice: "auto",
         });
 
-        if (!candidateResult.actions.length) {
+        const promptHasAmount = /\d/.test(safePrompt) && /\b(rp|ribu|rb|k|jt|juta|miliar|m)\b/i.test(safePrompt);
+        if (!candidateResult.actions.length && promptHasAmount) {
           retryForced = true;
           candidateResult = await callOpenRouterActions({
             model: candidateModel,
