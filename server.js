@@ -1716,6 +1716,16 @@ Rules:
 8) For media inputs, only discuss financial evidence that is visible in receipts, invoices, bank mutations, transfer proofs, payment screens, or similar transaction documents. Reject non-financial/random media politely.
 9) Refuse pornographic, sexually explicit, nude, or exploitative media and do not describe sexual details.
 ${brevityRule}
+11) **Plan Mode Rule**: If the user prompt indicates a financial mutation intent (like recording an expense, income, saving, or paying bills/debts, e.g., 'bayar tagihan listrik saya', 'tolong catat makan siang', 'sisihkan uang untuk tabungan', 'bayar cicilan motor', etc.) but does NOT specify a numeric amount/nominal, you MUST activate **Plan Mode**. Explain politely that you need the amount to proceed, and then append the following format at the very end of your response:
+    [PLAN_MODE: Title | Option 1 | Option 2 | Option 3 | Lainnya]
+    where:
+    - 'Title' is a concise action description (e.g., 'Bayar Tagihan Listrik', 'Catat Makan Siang').
+    - 'Option 1', 'Option 2', 'Option 3' are three realistic numeric choices for the user, in formatted Rupiah (e.g., 'Rp 50.000', 'Rp 100.000', 'Rp 200.000' or appropriate ranges for the context).
+    - The 4th option MUST be 'Lainnya'.
+    Example response:
+    'Tentu! Untuk mencatat pembayaran tagihan listrik Anda, silakan pilih nominalnya di bawah ini atau ketik sendiri:
+    [PLAN_MODE: Bayar Tagihan Listrik | Rp 50.000 | Rp 100.000 | Rp 200.000 | Lainnya]'
+    If the prompt already contains a numeric amount/nominal, do NOT output the PLAN_MODE tag.
 
 Compact context:
 ${JSON.stringify(compactData)}`;
@@ -1744,7 +1754,7 @@ Rules:
    - "beli emas 1 juta" => addTransaction({ type: "asset", amount: 1000000, category: "Emas" })
    - "dapat gaji 5 juta" => addTransaction({ type: "income", amount: 5000000, category: "Gaji" })
    - "makan 25 ribu" => addTransaction({ type: "expense", amount: 25000, category: "Makan & Minum" })
-12) If amount is missing, set default amount to 17000 only for typed chat requests. For extracted media transactions, never use a default amount; do not call tools when amount is missing.
+12) If amount/nominal is missing in the user request, DO NOT call any tools. Do not guess or use a default amount like 17000. Instead, return no tool calls so the system can ask the user for clarification.
 13) If date is missing, still send transaction and let app use local today's date.
 14) You may call multiple tools when needed.
 15) If user asks pure analysis/advice without mutation intent, do not call tools.
@@ -1755,6 +1765,7 @@ Rules:
 20) Never infer a transaction from a random object/photo/video alone. A car photo/video is not a car purchase transaction unless a receipt, invoice, transfer proof, or mutation is visible.
 21) Refuse pornographic, sexually explicit, nude, or exploitative media. Do not call tools for unsafe media.
 22) Response language: ${targetLanguage}.
+23) If the user prompt starts with or contains 'Lanjutkan rencana:' followed by an action and an amount, this means the user has selected a Plan Mode option. Parse the action and amount, and execute the corresponding tool (e.g. addTransaction) with that exact amount. Formulate the correct type (income/expense/saving/debt_payment/asset) based on the action.
 
 Compact context:
 ${JSON.stringify(compactData)}`;
@@ -3846,6 +3857,10 @@ const readUserBootstrapData = async (userId) => {
       ? {
           plan: String(subscription.plan || ""),
           status: String(subscription.status || ""),
+          expiresAt: subscription.expires_at || null,
+          createdAt: subscription.created_at || null,
+          productId: subscription.product_id || null,
+          purchaseToken: subscription.purchase_token || null,
         }
       : null,
     accessOverride: accessOverride
@@ -6668,11 +6683,9 @@ app.post("/api/subscription/cancel", requireSupabaseUser, async (req, res) => {
       }
     }
 
-    // 2. Disconnect active entitlement in database after Google Play cancellation succeeds.
+    // 2. Delete the active subscription record from the database.
     await supabaseRestFetch(`${SUBSCRIPTION_TABLE}?id=eq.${encodeURIComponent(sub.id)}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=representation" },
-      body: JSON.stringify({ status: "canceled", google_subscription_state: "SUBSCRIPTION_STATE_CANCELED" }),
+      method: "DELETE",
     });
 
     return res.json({ ok: true, message: "Subscription berhasil dibatalkan." });
