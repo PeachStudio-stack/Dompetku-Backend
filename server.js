@@ -1125,6 +1125,8 @@ const AGENT_ACTION_TOOLS_RAW = [
         type: "object",
         properties: {
           name: { type: "string" },
+          category: { type: "string" },
+          kategori: { type: "string" },
           limit: { type: "number" },
         },
         required: ["name", "limit"],
@@ -1140,6 +1142,8 @@ const AGENT_ACTION_TOOLS_RAW = [
         type: "object",
         properties: {
           name: { type: "string" },
+          category: { type: "string" },
+          kategori: { type: "string" },
           limit: { type: "number" },
         },
         required: ["name", "limit"],
@@ -1704,7 +1708,7 @@ const buildSystemInstruction = (targetLanguage, compactData, accessPlan) => {
     brevityRule = "10) IMPORTANT: Provide detailed, rich, and comprehensive answers. Use structured lists, clear tables, and deep insights.";
   }
 
-  const todayStr = new Date().toISOString().slice(0, 10);
+  const todayStr = getLocalUsageDate();
 
   return `You are an AI personal finance assistant for everyday users age 18-28.
 Rules:
@@ -1736,7 +1740,7 @@ ${JSON.stringify(compactData)}`;
 };
 
 const buildActionSystemInstruction = (targetLanguage, compactData) => {
-  const todayStr = new Date().toISOString().slice(0, 10);
+  const todayStr = getLocalUsageDate();
   return `You are a personal-finance action planner.
 Return tool calls only for state-changing intent. Do not output JSON patch text.
 Rules:
@@ -1761,7 +1765,7 @@ Rules:
    - "dapat gaji 5 juta" => addTransaction({ type: "income", amount: 5000000, category: "Gaji" })
    - "makan 25 ribu" => addTransaction({ type: "expense", amount: 25000, category: "Makan & Minum" })
 12) If amount/nominal is missing in the user request, DO NOT call any tools. Do not guess or use a default amount like 17000. Instead, return no tool calls so the system can ask the user for clarification.
-13) If date is missing, still send transaction and let app use local today's date.
+13) For ordinary transaction dates, do not calculate relative dates yourself. If the user explicitly mentions a date (for example "10 Juni", "tgl 10/6", "2026-06-10", "hari ini", "kemarin", "besok"), copy that exact date text/value into tanggal/date. If date is missing, omit date and let the app use local today's date.
 14) You may call multiple tools when needed.
 15) If user asks pure analysis/advice without mutation intent, do not call tools.
 16) If user asks for advice/consultation/analysis, do not mutate data and do not call tools.
@@ -2958,6 +2962,165 @@ const ensureTxDate = (value) => {
   return `${y}-${m}-${d}T${hh}:${mm}`;
 };
 
+const TRANSACTION_DATE_ACTION_NAMES = new Set(["addTransaction", "createTransaction", "updateTransaction", "addTabungan"]);
+const MONTH_NAME_MAP = {
+  januari: 1,
+  jan: 1,
+  febuari: 2,
+  februari: 2,
+  feb: 2,
+  maret: 3,
+  mar: 3,
+  april: 4,
+  apr: 4,
+  mei: 5,
+  june: 6,
+  juni: 6,
+  jun: 6,
+  july: 7,
+  juli: 7,
+  jul: 7,
+  agustus: 8,
+  agu: 8,
+  ags: 8,
+  aug: 8,
+  september: 9,
+  sep: 9,
+  sept: 9,
+  oktober: 10,
+  okt: 10,
+  oct: 10,
+  november: 11,
+  nov: 11,
+  desember: 12,
+  des: 12,
+  dec: 12,
+};
+
+const resolveClientTimeZone = (timeZone) => {
+  const candidate = String(timeZone || "").trim();
+  if (candidate) {
+    try {
+      new Intl.DateTimeFormat("en-US", { timeZone: candidate }).format(new Date());
+      return candidate;
+    } catch (_err) {
+      // Fall through to Jakarta default.
+    }
+  }
+  return "Asia/Jakarta";
+};
+
+const localDatePartsForZone = (date = new Date(), timeZone) => {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: resolveClientTimeZone(timeZone),
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const get = (type) => Number(parts.find((part) => part.type === type)?.value || 0);
+  return { year: get("year"), month: get("month"), day: get("day") };
+};
+
+const pad2 = (value) => String(value).padStart(2, "0");
+const makeYmd = (year, month, day) => {
+  if (!year || !month || !day) return null;
+  const candidate = new Date(year, month - 1, day);
+  if (candidate.getFullYear() !== year || candidate.getMonth() !== month - 1 || candidate.getDate() !== day) {
+    return null;
+  }
+  return `${year}-${pad2(month)}-${pad2(day)}`;
+};
+
+const localDateTimeValueForZone = (date = new Date(), timeZone) => {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: resolveClientTimeZone(timeZone),
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const get = (type) => parts.find((part) => part.type === type)?.value || "00";
+  return `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}`;
+};
+
+const extractManualTransactionTime = (prompt) => {
+  const normalized = String(prompt || "").toLowerCase();
+  const timeMatch = normalized.match(/\b(?:jam|pukul|pk\.?|at)?\s*([01]?\d|2[0-3])(?:[:. ]([0-5]\d))?\b/);
+  if (!timeMatch) return null;
+  return `${pad2(Number(timeMatch[1]))}:${pad2(Number(timeMatch[2] || 0))}`;
+};
+
+const normalizeActionDateValue = (value, timeZone, referenceDate = new Date()) => {
+  const raw = String(value || "").trim();
+  if (!raw) return localDateTimeValueForZone(referenceDate, timeZone);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return `${raw}T00:00`;
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(raw)) return raw.slice(0, 16);
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return localDateTimeValueForZone(referenceDate, timeZone);
+  return localDateTimeValueForZone(parsed, timeZone);
+};
+
+const extractManualTransactionDate = (prompt, referenceDate = new Date(), timeZone) => {
+  const normalized = String(prompt || "").toLowerCase().replace(/\s+/g, " ");
+  if (!normalized.trim()) return null;
+  const today = localDatePartsForZone(referenceDate, timeZone);
+  const iso = normalized.match(/\b(20\d{2})[-/](0?[1-9]|1[0-2])[-/](0?[1-9]|[12]\d|3[01])\b/);
+  if (iso) return makeYmd(Number(iso[1]), Number(iso[2]), Number(iso[3]));
+
+  const dmy = normalized.match(/\b(?:tgl|tanggal|pada|di|date)?\s*(0?[1-9]|[12]\d|3[01])[-/](0?[1-9]|1[0-2])(?:[-/](20\d{2}|\d{2}))?\b/);
+  if (dmy) {
+    const yearRaw = dmy[3] ? Number(dmy[3]) : today.year;
+    return makeYmd(yearRaw < 100 ? 2000 + yearRaw : yearRaw, Number(dmy[2]), Number(dmy[1]));
+  }
+
+  const monthNames = Object.keys(MONTH_NAME_MAP).join("|");
+  const textDate = normalized.match(new RegExp(`\\b(?:tgl|tanggal|pada|di)?\\s*(0?[1-9]|[12]\\d|3[01])\\s+(${monthNames})(?:\\s+(20\\d{2}|\\d{2}))?\\b`, "i"));
+  if (textDate) {
+    const yearRaw = textDate[3] ? Number(textDate[3]) : today.year;
+    return makeYmd(yearRaw < 100 ? 2000 + yearRaw : yearRaw, MONTH_NAME_MAP[textDate[2].toLowerCase()], Number(textDate[1]));
+  }
+
+  if (/\b(hari ini|today)\b/.test(normalized)) return makeYmd(today.year, today.month, today.day);
+  if (/\b(kemarin|yesterday)\b/.test(normalized)) {
+    const d = new Date(referenceDate);
+    d.setDate(d.getDate() - 1);
+    const parts = localDatePartsForZone(d, timeZone);
+    return makeYmd(parts.year, parts.month, parts.day);
+  }
+  if (/\b(besok|tomorrow)\b/.test(normalized)) {
+    const d = new Date(referenceDate);
+    d.setDate(d.getDate() + 1);
+    const parts = localDatePartsForZone(d, timeZone);
+    return makeYmd(parts.year, parts.month, parts.day);
+  }
+  return null;
+};
+
+const applyManualTransactionDates = (actions, prompt, timeZone, referenceDate = new Date()) => {
+  const manualDate = extractManualTransactionDate(prompt, referenceDate, timeZone);
+  const manualTime = extractManualTransactionTime(prompt);
+  return (Array.isArray(actions) ? actions : []).map((action) => {
+    if (!TRANSACTION_DATE_ACTION_NAMES.has(String(action?.name || ""))) return action;
+    const existingDate = action.args?.date || action.args?.tanggal;
+    const shouldUseCurrentLocalTime = ["addTransaction", "createTransaction", "addTabungan"].includes(String(action?.name || ""));
+    const dateValue = manualDate
+      ? `${manualDate}T${manualTime || "00:00"}`
+      : shouldUseCurrentLocalTime
+        ? localDateTimeValueForZone(referenceDate, timeZone)
+        : normalizeActionDateValue(existingDate, timeZone, referenceDate);
+    return {
+      ...action,
+      args: {
+        ...(action.args || {}),
+        date: dateValue,
+        tanggal: dateValue.slice(0, 10),
+      },
+    };
+  });
+};
+
 const resolveWalletName = (data, candidate) => {
   const given = normalizeName(candidate);
   const keys = Object.keys(data.wallets || {});
@@ -3060,13 +3223,15 @@ const syncBudgetsWithTransactions = (data) => {
   const next = { ...data };
   const budgets = {};
   for (const name of Object.keys(next.budgets || {})) {
-    budgets[name] = { ...next.budgets[name], spent: 0 };
+    budgets[name] = { ...next.budgets[name], category: next.budgets[name]?.category || name, spent: 0 };
   }
   const txs = Array.isArray(next.transactions) ? next.transactions : [];
   for (const tx of txs) {
     if (tx.type !== "expense") continue;
     const catName = tx.category || "Lainnya";
-    const budgetName = findBestKey(catName, Object.keys(budgets));
+    const budgetName =
+      Object.keys(budgets).find((name) => normalizeName(budgets[name]?.category) === normalizeName(catName)) ||
+      findBestKey(catName, Object.keys(budgets));
     if (budgetName) {
       budgets[budgetName].spent = Number(budgets[budgetName].spent || 0) + Number(tx.amount || 0);
     }
@@ -3202,14 +3367,20 @@ const executeAgentActionsServerSide = (currentData, actions) => {
 
     if (name === "createBudget" || name === "updateBudget") {
       const budgetName = normalizeName(args.name);
+      const budgetCategory = normalizeName(args.category || args.kategori) || budgetName;
       const limit = parseAmount(args.limit);
       if (!budgetName || limit <= 0) continue;
       const existingName = findBestKey(budgetName, Object.keys(next.budgets || {})) || budgetName;
+      next.categories = {
+        ...(next.categories || {}),
+        expenses: Array.from(new Set([...(next.categories?.expenses || []), budgetCategory])),
+      };
       next.budgets = {
         ...(next.budgets || {}),
         [existingName]: {
           limit,
           spent: Number(next.budgets?.[existingName]?.spent || 0),
+          category: budgetCategory,
           note: String(args.note || next.budgets?.[existingName]?.note || "").trim(),
           updatedAt: new Date().toISOString(),
         },
@@ -5199,6 +5370,9 @@ app.post("/api/agent/actions", async (req, res) => {
   let safePrompt = "";
   try {
     const { currentData, language, accessPlan: clientAccessPlan } = req.body || {};
+    const clientTimeZone = resolveClientTimeZone(req.body?.clientTimeZone);
+    const clientNow = req.body?.clientNowIso ? new Date(req.body.clientNowIso) : new Date();
+    const clientReferenceDate = Number.isNaN(clientNow.getTime()) ? new Date() : clientNow;
     const requestAgentMode = String(req.body?.agentMode || "").toLowerCase();
     if (req.body?.readOnly === true || requestAgentMode === "assistant") {
       return res.status(403).json({
@@ -5362,10 +5536,11 @@ app.post("/api/agent/actions", async (req, res) => {
     });
 
     cleanupExpiredActionConfirmations();
-    const filteredActions = (Array.isArray(result.actions) ? result.actions : []).filter((action) =>
+    const allowedActions = (Array.isArray(result.actions) ? result.actions : []).filter((action) =>
       isAllowedAgentAction(action)
     );
-    const droppedCount = (Array.isArray(result.actions) ? result.actions.length : 0) - filteredActions.length;
+    const filteredActions = applyManualTransactionDates(allowedActions, safePrompt, clientTimeZone, clientReferenceDate);
+    const droppedCount = (Array.isArray(result.actions) ? result.actions.length : 0) - allowedActions.length;
 
     const hasTransactionAction = filteredActions.some((action) =>
       ["addTransaction", "createTransaction", "updateTransaction", "deleteTransaction", "bulkUpdateTransactions", "bulkDeleteTransactions"].includes(
@@ -5399,6 +5574,7 @@ app.post("/api/agent/actions", async (req, res) => {
           matchedEntity: matched,
           candidates,
         },
+        sourcePrompt: safePrompt,
         options: {
           apply_related: {
             actions: relateActions,
@@ -5448,6 +5624,7 @@ app.post("/api/agent/actions", async (req, res) => {
       await savePendingAction(confirmationId, userId, "confirmation", {
         actions: confirmationActions,
         summary,
+        sourcePrompt: safePrompt,
       });
       confirmationRequests.push({
         id: confirmationId,
@@ -5455,6 +5632,7 @@ app.post("/api/agent/actions", async (req, res) => {
         message: summary,
         summary,
         actions: confirmationActions,
+        sourcePrompt: safePrompt,
         kind: "mutating",
       });
     }
@@ -5635,6 +5813,7 @@ app.post("/api/agent/actions/select", async (req, res) => {
     await savePendingAction(confirmationId, userId, "confirmation", {
       actions,
       summary,
+      sourcePrompt: pending.sourcePrompt || "",
     });
     return res.json({
       ok: true,
@@ -5646,6 +5825,7 @@ app.post("/api/agent/actions/select", async (req, res) => {
           message: summary,
           summary,
           actions,
+          sourcePrompt: pending.sourcePrompt || "",
           kind: "mutating",
         },
       ],
