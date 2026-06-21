@@ -1,7 +1,7 @@
 [morning]
 Selamat pagi! Yuk cek dompet hari ini sebelum mulai aktivitas.
 Pagi cerah, waktunya review keuangan. Sudah catat pengeluaran semalam?
-Mulai hari dengan bijak! Cek saldo dan budget kamu di Dompetku.
+Mulai hari dengan bijak! Cek saldo dan budget kamu di DompetAI.
 
 [noon]
 Siang ini, cek transaksi makan dan belanja agar catatan tetap rapi.
@@ -15,5 +15,5 @@ Waktunya cek progres tabungan. Sudah dekat target bulan ini?
 
 [night]
 Sebelum tidur, cek lagi transaksi hari ini supaya catatan tetap rapi.
-Hari ini pengeluaranmu gimana? Yuk rekap di Dompetku sebelum tidur.
+Hari ini pengeluaranmu gimana? Yuk rekap di DompetAI sebelum tidur.
 Malam ini, luangkan 1 menit untuk review keuangan harianmu.

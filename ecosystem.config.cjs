@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: "Dompetku-BackendOnly",
+      name: "DompetAI-BackendOnly",
       script: "server.js",
       cwd: "/var/www/BackendOnly",
       instances: 1,
