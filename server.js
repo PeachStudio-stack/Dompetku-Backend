@@ -1425,7 +1425,7 @@ const readNotificationMessages = async () => {
 };
 
 const DAILY_NOTIFICATION_SLOTS = {
-  morning: { title: "Dompetku pagi ini", hour: 7, minute: 0 },
+  morning: { title: "DompetAI pagi ini", hour: 7, minute: 0 },
   noon: { title: "Cek dompet siang", hour: 12, minute: 0 },
   afternoon: { title: "Cek dompet sore", hour: 16, minute: 0 },
   night: { title: "Ringkas hari ini", hour: 20, minute: 0 },
@@ -1489,7 +1489,7 @@ const dueNotificationSlotsForPreference = (preference, now = new Date()) => {
 };
 
 const pickNotificationMessage = (messages, slotName) => {
-  const fallback = DEFAULT_NOTIFICATION_MESSAGES[slotName]?.[0] || "Cek Dompetku hari ini.";
+  const fallback = DEFAULT_NOTIFICATION_MESSAGES[slotName]?.[0] || "Cek DompetAI hari ini.";
   const pool = (messages?.[slotName] || [])
     .map((item) => toSafeTrimmed(item))
     .filter(Boolean);
@@ -2146,6 +2146,77 @@ const calculateFinancialHealth = (data, overrideMonth) => {
   };
 };
 
+const buildLocalRecommendations = (currentData, targetLanguage, localHealth) => {
+  const isIndo = String(targetLanguage).toLowerCase().startsWith("id");
+  const sum = (values) => values.reduce((total, val) => total + (Number(val) || 0), 0);
+  const totalMoney = (obj = {}) => sum(Object.values(obj || {}));
+
+  const income = totalMoney(currentData?.income || {});
+  const expenses = totalMoney(currentData?.expenses || {});
+  const cashflow = income - expenses;
+  const debts = totalMoney(currentData?.debts || {});
+  
+  const recommendations = [];
+
+  // 1. Cashflow Recommendation
+  if (isIndo) {
+    if (cashflow > 0) {
+      recommendations.push(`🎉 Arus kas positif! Bulan ini pemasukanmu lebih besar dari pengeluaran sebesar Rp${Math.round(cashflow).toLocaleString("id-ID")}.`);
+    } else if (cashflow < 0) {
+      recommendations.push(`⚠️ Pengeluaran melebihi pemasukan sebesar Rp${Math.round(Math.abs(cashflow)).toLocaleString("id-ID")}. Coba batasi belanja non-essential.`);
+    } else {
+      recommendations.push("⚖️ Pemasukan dan pengeluaran seimbang. Coba buat anggaran belanja untuk mulai menyisihkan tabungan.");
+    }
+  } else {
+    if (cashflow > 0) {
+      recommendations.push(`🎉 Positive cash flow! This month's income exceeds expenses by Rp${Math.round(cashflow).toLocaleString("en-US")}.`);
+    } else if (cashflow < 0) {
+      recommendations.push(`⚠️ Expenses exceed income by Rp${Math.round(Math.abs(cashflow)).toLocaleString("en-US")}. Try limiting discretionary spending.`);
+    } else {
+      recommendations.push("⚖️ Balanced income and expenses. Try creating a budget to start setting aside savings.");
+    }
+  }
+
+  // 2. Savings Recommendation
+  const savingsCurrent = sum(
+    Object.values(currentData?.tabunganPlans || {}).map((plan) => Number(plan?.current) || 0)
+  );
+  if (isIndo) {
+    if (savingsCurrent > 0) {
+      recommendations.push("🌱 Bagus! Kamu sudah aktif menabung. Pertahankan disiplin ini untuk mempercepat target tujuan finansialmu.");
+    } else {
+      recommendations.push("🌱 Mulai sisihkan minimal 10-20% dari total pemasukan di awal bulan khusus untuk pos tabungan darurat.");
+    }
+  } else {
+    if (savingsCurrent > 0) {
+      recommendations.push("🌱 Great job! You are actively saving. Keep up this discipline to accelerate your financial goals.");
+    } else {
+      recommendations.push("🌱 Start setting aside at least 10-20% of your total income at the beginning of the month specifically for emergency savings.");
+    }
+  }
+
+  // 3. Health Score / Debt Recommendation
+  if (isIndo) {
+    if (debts > 0) {
+      recommendations.push(`💼 Total utang saat ini Rp${Math.round(debts).toLocaleString("id-ID")}. Prioritaskan pelunasan utang berbunga tinggi terlebih dahulu.`);
+    } else if (localHealth.score >= 75) {
+      recommendations.push("🍵 Skor kesehatan keuanganmu sangat sehat. Terus pertahankan rasio belanja dan menabung yang disiplin!");
+    } else {
+      recommendations.push("💡 Skor kesehatan keuanganmu perlu ditingkatkan. Batasi pengeluaran bulanan dan pantau berkala lewat grafik kategori.");
+    }
+  } else {
+    if (debts > 0) {
+      recommendations.push(`💼 Current total debt is Rp${Math.round(debts).toLocaleString("en-US")}. Prioritize paying off high-interest debts first.`);
+    } else if (localHealth.score >= 75) {
+      recommendations.push("🍵 Your financial health score is very healthy. Keep maintaining disciplined spending and savings ratios!");
+    } else {
+      recommendations.push("💡 Your financial health score can be improved. Limit monthly expenses and monitor them regularly via category charts.");
+    }
+  }
+
+  return recommendations.slice(0, 3);
+};
+
 const buildReportRecommendationPrompt = (targetLanguage, currentData, calculatedScore, calculatedStatus) => {
   const summary = JSON.stringify(
     {
@@ -2170,7 +2241,7 @@ const buildReportRecommendationPrompt = (targetLanguage, currentData, calculated
     2
   );
 
-  return `Anda adalah analis keuangan pribadi untuk aplikasi Dompetku.
+  return `Anda adalah analis keuangan pribadi untuk aplikasi DompetAI.
 Tugas:
 1) Berikan 3 rekomendasi paling berdampak, praktis, dan mudah dipahami berdasarkan data user.
 2) Skor kesehatan keuangan user (Financial Health Score) saat ini adalah ${calculatedScore} (Status: ${calculatedStatus}). Gunakan skor dan status ini sebagai referensi ketika memberikan rekomendasi.
@@ -2401,7 +2472,7 @@ const openRouterFetch = async ({ model, timeoutMs, messages, maxTokens, stream, 
           Authorization: `Bearer ${OPENROUTER_API_KEY}`,
           "Content-Type": "application/json",
           "HTTP-Referer": referer || "http://localhost:3000",
-          "X-Title": "Dompetku BackendOnly",
+          "X-Title": "DompetAI BackendOnly",
         },
         body: JSON.stringify({
           model,
@@ -2649,7 +2720,7 @@ const callOpenRouterActions = async (params) => {
         Authorization: `Bearer ${OPENROUTER_API_KEY}`,
         "Content-Type": "application/json",
         "HTTP-Referer": params.referer || "http://localhost:3000",
-        "X-Title": "Dompetku BackendOnly Actions",
+        "X-Title": "DompetAI BackendOnly Actions",
       },
       body: JSON.stringify({
         model: params.model,
@@ -4137,7 +4208,7 @@ app.use("/api/iap", makeLimiter(RATE_LIMIT_IAP_MAX, "iap"));
 app.get("/health", (_req, res) => {
   const base = {
     ok: true,
-    app: "Dompetku-BackendOnly",
+    app: "DompetAI-BackendOnly",
     env: NODE_ENV,
   };
   if (IS_PRODUCTION) {
@@ -4300,7 +4371,7 @@ app.post("/api/push/chat", requireSupabaseUser, async (req, res) => {
 
     const conversationId = toSafeTrimmed(req.body?.conversationId || "default");
     const messageId = toSafeTrimmed(req.body?.messageId || `msg_${Date.now()}`);
-    const senderName = toSafeTrimmed(req.body?.senderName || "Agen Dompetku");
+    const senderName = toSafeTrimmed(req.body?.senderName || "Agen DompetAI");
     const messageText = toSafeTrimmed(req.body?.messageText);
     const avatarUrl = toSafeTrimmed(req.body?.avatarUrl);
     const directFcmToken = toSafeTrimmed(req.body?.fcmToken);
@@ -4453,7 +4524,7 @@ app.post("/api/push/chat/reply", requireSupabaseUser, async (req, res) => {
         data: {
           conversationId: conversationId || "default",
           messageId: `msg_${Date.now()}`,
-          senderName: "Agen Dompetku",
+          senderName: "Agen DompetAI",
           messageText: responseText,
           timestamp: String(Date.now()),
           avatarUrl: "",
@@ -4476,7 +4547,7 @@ app.post("/api/push/chat/broadcast", async (req, res) => {
 
     const conversationId = toSafeTrimmed(req.body?.conversationId || "broadcast");
     const messageId = toSafeTrimmed(req.body?.messageId || `broadcast_${Date.now()}`);
-    const senderName = toSafeTrimmed(req.body?.senderName || "Agen Dompetku");
+    const senderName = toSafeTrimmed(req.body?.senderName || "Agen DompetAI");
     const messageText = toSafeTrimmed(req.body?.messageText);
     const avatarUrl = toSafeTrimmed(req.body?.avatarUrl);
     const timestamp = String(Number(req.body?.timestamp) || Date.now());
@@ -4626,7 +4697,7 @@ const runDailyNotificationSchedulerTick = async (now = new Date()) => {
               messageText,
               timestamp: String(Date.now()),
               avatarUrl: "",
-              source: "dompetku_daily",
+              source: "dompetai_daily",
               slot: slot.name,
               deliveryDate: slot.deliveryDate,
               timezoneName: slot.timezoneName,
@@ -4730,6 +4801,7 @@ app.put("/api/accounting-snapshot", requireSupabaseUser, async (req, res) => {
     const familyCtx = await resolveFamilyContext(userId);
     const targetUserId = familyCtx.inFamily ? familyCtx.ownerId : userId;
     const accountingData = normalizeAccountingData(req.body?.accountingData || req.body?.accounting_data || {});
+    const isReset = req.body?.reset === true;
 
     // Fetch existing snapshot to merge transactions and prevent background updates loss
     const oldRows = await supabaseRestFetch(
@@ -4747,7 +4819,7 @@ app.put("/api/accounting-snapshot", requireSupabaseUser, async (req, res) => {
     }
 
     let mergedData = accountingData;
-    if (oldSnapshot) {
+    if (oldSnapshot && !isReset) {
       mergedData = mergeAccountingDataServerSide(accountingData, oldSnapshot);
     }
 
@@ -6483,110 +6555,28 @@ Rules:
 app.post("/api/report/recommendations", async (req, res) => {
   const started = Date.now();
   try {
-    const { currentData, language, accessPlan: clientAccessPlan } = req.body || {};
+    const { currentData, language } = req.body || {};
     const targetLanguage = String(language || "Indonesian");
     if (!currentData || typeof currentData !== "object") {
       return res.status(400).json({ error: "Missing currentData." });
     }
 
-    // Server-side subscription verification
-    let accessPlan = clientAccessPlan || "free";
-    const bearerToken = getBearerTokenFromRequest(req);
-    if (bearerToken) {
-      try {
-        const authUser = await verifySupabaseUserAccessToken(bearerToken);
-        if (authUser?.id) {
-          const dbPlan = await resolveUserAccessPlanFromDB(authUser.id);
-          if (dbPlan !== null) accessPlan = dbPlan;
-        }
-      } catch (_authErr) { /* non-authed request */ }
-    }
-
-    const modelPolicy = resolveAiRouteModelPolicy({
-      route: "report_recommendations",
-      prompt: JSON.stringify(currentData || {}).slice(0, 4000),
-      accessPlan,
-    });
-    let usedModel = modelPolicy.primaryModel;
-    let fallbackUsed = false;
-
-    logAiRoute("/api/report/recommendations", {
-      accessPlan: accessPlan || "free",
-      plan_tier: modelPolicy.planTier,
-      model: modelPolicy.primaryModel,
-      model_primary: modelPolicy.primaryModel,
-      model_fallback_chain: modelPolicy.fallbackModels,
-    });
-
     const localHealth = calculateFinancialHealth(currentData, req.body.month);
-
-    let result = null;
-    let lastRouteError = null;
-    const modelAttempts = [];
-    for (let idx = 0; idx < modelPolicy.modelFallbackChain.length; idx += 1) {
-      const candidateModel = modelPolicy.modelFallbackChain[idx];
-      try {
-        result = await callOpenRouterText({
-          model: candidateModel,
-          timeoutMs: 18000,
-          maxTokens: 220,
-          referer: req.headers.referer,
-          messages: [
-            {
-              role: "user",
-              content: buildReportRecommendationPrompt(targetLanguage, currentData, localHealth.score, localHealth.status),
-            },
-          ],
-        });
-        usedModel = candidateModel;
-        fallbackUsed = idx > 0;
-        modelAttempts.push({ model: candidateModel, ok: true });
-        break;
-      } catch (candidateError) {
-        lastRouteError = candidateError;
-        modelAttempts.push({
-          model: candidateModel,
-          ok: false,
-          reason: getAiErrorCode(candidateError),
-          retriable: isRetriableAiError(candidateError),
-        });
-        if (!isRetriableAiError(candidateError)) break;
-      }
-    }
-    if (!result && lastRouteError) throw lastRouteError;
-
-    const aiResult = parseReportAiResult(result?.text);
-    if (!aiResult.recommendations.length) {
-      throw new Error("No report AI result returned");
-    }
+    const recommendations = buildLocalRecommendations(currentData, targetLanguage, localHealth);
 
     return res.json({
-      recommendations: aiResult.recommendations,
+      recommendations,
       healthScore: localHealth.score,
       healthStatus: localHealth.status,
       metadata: {
-        processing_mode: "report_recommendation",
-        model_used: usedModel,
-        model_primary: modelPolicy.primaryModel,
-        model_fallback_chain: modelPolicy.fallbackModels,
-        plan_tier: modelPolicy.planTier,
-        final_model_used: usedModel,
-        fallback_used: fallbackUsed,
-        model_attempts: modelAttempts,
-        ttft_ms: result?.ttftMs,
+        processing_mode: "local_report_recommendation",
+        model_used: "none (local rule-based)",
         total_ms: Date.now() - started,
       },
     });
   } catch (error) {
-    if (getAiErrorCode(error) !== "unknown") {
-      const status = getAiErrorCode(error) === "rate_limited" ? 429 : 503;
-      return res.status(status).json({
-        error: getAiUserFacingMessage(error),
-        error_code: getAiErrorCode(error),
-      });
-    }
     console.error("Report Recommendation Error:", error);
-    return res.status(503).json({ error: error?.message || "Report recommendations unavailable" });
+    return res.status(500).json({ error: error?.message || "Report recommendations unavailable" });
   }
 });
 

@@ -1,4 +1,4 @@
-# BackendOnly (Dompetku API Proxy)
+# BackendOnly (DompetAI API Proxy)
 
 Folder ini backend terpisah untuk dipasang di VPS Ubuntu tanpa upload seluruh project frontend.
 
@@ -64,7 +64,7 @@ TRUST_PROXY=loopback
 ### Opsi cepat
 
 ```bash
-pm2 start server.js --name Dompetku-BackendOnly
+pm2 start server.js --name DompetAI-BackendOnly
 pm2 save
 ```
 
@@ -81,7 +81,7 @@ pm2 save
 
 ```bash
 pm2 list
-pm2 logs Dompetku-BackendOnly --lines 100
+pm2 logs DompetAI-BackendOnly --lines 100
 ```
 
 ## Endpoint yang tersedia
@@ -151,7 +151,7 @@ curl -sS -X POST http://127.0.0.1:3000/api/notifications/daily/send-due \
 curl -sS -X POST http://127.0.0.1:3000/api/push/chat \
   -H "Authorization: Bearer SUPABASE_USER_ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"conversationId":"conv_123","messageText":"Halo dari backend","senderName":"Agen Dompetku"}'
+  -d '{"conversationId":"conv_123","messageText":"Halo dari backend","senderName":"Agen DompetAI"}'
 ```
 
 ### Kirim push chat ke user lain (internal server key)
@@ -161,7 +161,7 @@ curl -sS -X POST http://127.0.0.1:3000/api/push/chat \
   -H "Authorization: Bearer SUPABASE_USER_ACCESS_TOKEN" \
   -H "x-internal-key: INTERNAL_API_KEY_VALUE" \
   -H "Content-Type: application/json" \
-  -d '{"userId":"TARGET_SUPABASE_USER_ID","conversationId":"conv_123","messageText":"Halo user target","senderName":"Agen Dompetku"}'
+  -d '{"userId":"TARGET_SUPABASE_USER_ID","conversationId":"conv_123","messageText":"Halo user target","senderName":"Agen DompetAI"}'
 ```
 
 ### Kirim push chat ke semua user Android
@@ -170,7 +170,7 @@ curl -sS -X POST http://127.0.0.1:3000/api/push/chat \
 curl -sS -X POST http://127.0.0.1:3000/api/push/chat/broadcast \
   -H "x-internal-key: INTERNAL_API_KEY_VALUE" \
   -H "Content-Type: application/json" \
-  -d '{"conversationId":"broadcast","messageText":"Halo semua, ini notifikasi broadcast dari Dompetku","senderName":"Agen Dompetku"}'
+  -d '{"conversationId":"broadcast","messageText":"Halo semua, ini notifikasi broadcast dari DompetAI","senderName":"Agen DompetAI"}'
 ```
 
 ## Catatan keamanan
