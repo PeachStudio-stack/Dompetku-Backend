@@ -25,16 +25,16 @@ const DEFAULT_NOTIFICATION_MESSAGES = {
 const PORT = Number(process.env.PORT || 3000);
 const OPENROUTER_URL = process.env.OPENROUTER_URL || "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
-const OPENROUTER_MODEL_PAID = process.env.OPENROUTER_MODEL_PAID || "minimax/minimax-m3";
+const OPENROUTER_MODEL_PAID = process.env.OPENROUTER_MODEL_PAID || "xiaomi/mimo-v2.5-pro";
 const OPENROUTER_MODEL_QUICK_SUGGEST =
   process.env.OPENROUTER_MODEL_QUICK_SUGGEST || "deepseek/deepseek-v4-flash";
 const OPENROUTER_MODEL_FREE = process.env.OPENROUTER_MODEL_FREE || "deepseek/deepseek-v4-flash";
 const OPENROUTER_MODEL_REPORT_RECOMMENDATION =
   process.env.OPENROUTER_MODEL_REPORT_RECOMMENDATION || "deepseek/deepseek-v4-flash";
 const OPENROUTER_MODEL_VISION_FREE =
-  process.env.OPENROUTER_MODEL_VISION_FREE || "google/gemini-2.5-flash:free";
+  process.env.OPENROUTER_MODEL_VISION_FREE || "minimax/minimax-m3";
 const OPENROUTER_MODEL_VISION_PAID =
-  process.env.OPENROUTER_MODEL_VISION_PAID || "google/gemini-2.5-flash";
+  process.env.OPENROUTER_MODEL_VISION_PAID || "minimax/minimax-m3";
 const OPENROUTER_MODEL_ACTIONS_FREE =
   process.env.OPENROUTER_MODEL_ACTIONS_FREE || "google/gemini-2.5-flash:free";
 const OPENROUTER_MODEL_ACTIONS_PAID =
@@ -1532,7 +1532,7 @@ const classifyIntent = (prompt) => {
   return heavyHints.some((hint) => text.includes(hint)) ? "analysis" : "simple";
 };
 
-const DEFAULT_PAID_MODEL = "minimax/minimax-m3";
+const DEFAULT_PAID_MODEL = "xiaomi/mimo-v2.5-pro";
 const DEFAULT_FREE_MODEL = "deepseek/deepseek-v4-flash";
 const warnedModelConfigLabels = new Set();
 
@@ -1578,8 +1578,8 @@ const resolveAiRouteModelPolicy = ({ route, prompt, accessPlan, hasAttachments }
     freeModel = sanitizeModelId(OPENROUTER_MODEL_ACTIONS_FREE, "google/gemini-2.5-flash:free");
     paidModel = sanitizePaidModelId(OPENROUTER_MODEL_ACTIONS_PAID, "google/gemini-2.5-flash", "OPENROUTER_MODEL_ACTIONS_PAID");
   } else if (hasAttachments) {
-    freeModel = sanitizeModelId(OPENROUTER_MODEL_VISION_FREE, "google/gemini-2.5-flash:free");
-    paidModel = sanitizePaidModelId(OPENROUTER_MODEL_VISION_PAID, "google/gemini-2.5-flash", "OPENROUTER_MODEL_VISION_PAID");
+    freeModel = sanitizeModelId(OPENROUTER_MODEL_VISION_FREE, "minimax/minimax-m3");
+    paidModel = sanitizePaidModelId(OPENROUTER_MODEL_VISION_PAID, "minimax/minimax-m3", "OPENROUTER_MODEL_VISION_PAID");
   }
 
   let maxTokens = 500;
