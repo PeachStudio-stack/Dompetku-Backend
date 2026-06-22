@@ -1039,7 +1039,7 @@ const TRANSACTION_TOOL_PARAMETERS = {
     classification_reason: { type: "string" },
     confidence: { type: "number", minimum: 0, maximum: 1 },
   },
-  required: ["type"],
+  required: ["type", "amount"],
 };
 const AGENT_ACTION_TOOLS_RAW = [
   {
@@ -1772,42 +1772,46 @@ ${JSON.stringify(compactData)}`;
 
 const buildActionSystemInstruction = (targetLanguage, compactData) => {
   const todayStr = getLocalUsageDate();
-  return `You are a personal-finance action planner.
-Return tool calls only for state-changing intent. Do not output JSON patch text.
-Rules:
-1) Use only available tools.
-2) For budget progress/spent updates, never set spent directly. Use transactions for spending.
-3) You are allowed to mutate: budget, tabungan (savings plans), transactions, and recurring transaction rules.
-4) Never use wallet tools or category tools. You are allowed to use recurring tools (createRecurringRule, updateRecurringRule, pauseRecurringRule, deleteRecurringRule) to manage automatic transaction schedules.
-5) Every transaction must use "Total Keuangan" as the account/wallet.
-6) Never fabricate money movement if funds are clearly insufficient.
-7) For income transaction, prefer fields: tanggal, jumlah, kategori, sumber, catatan.
-8) For expense transaction, prefer fields: tanggal, jumlah, kategori, metode, catatan.
-9) Classify transaction type by semantic money purpose, not by memorized keywords. Ask: after this transaction, did the user receive money, consume/spend money, move money into a savings goal, pay a liability, or convert cash into wealth/asset?
-   - income: user receives money, e.g. salary, bonus, freelance, sale proceeds, dividends/profit received.
-   - expense: money is consumed as a cost, e.g. food, transport, bills, shopping, fees, admin costs, losses.
-   - saving: money moved into an app-style savings target/plan, e.g. emergency fund, vacation, house goal.
-   - debt_payment: money pays debt/installments, e.g. loan, credit card, paylater, cicilan.
-   - asset: user buys/adds wealth or an investment instrument. This includes regional language, slang, mixed English/Indonesian, and typos when the meaning is converting cash into harta/aset.
-10) Do not classify by object name alone. "beli emas" is asset, "jual emas" is income, "fee beli emas" is expense, "rugi trading" is expense. Investment purchases reduce wallet cash but increase assets/harta.
-11) Required examples:
-   - "invest bitcoin 100 ribu" => addTransaction({ type: "asset", amount: 100000, category: "Bitcoin", description: "Investasi Bitcoin" })
-   - "beli emas 1 juta" => addTransaction({ type: "asset", amount: 1000000, category: "Emas" })
-   - "dapat gaji 5 juta" => addTransaction({ type: "income", amount: 5000000, category: "Gaji" })
-   - "makan 25 ribu" => addTransaction({ type: "expense", amount: 25000, category: "Makan & Minum" })
-12) If amount/nominal is missing in the user request, DO NOT call any tools. Do not guess or use a default amount like 17000. Instead, return no tool calls so the system can ask the user for clarification.
-13) For ordinary transaction dates, do not calculate relative dates yourself. If the user explicitly mentions a date (for example "10 Juni", "tgl 10/6", "2026-06-10", "hari ini", "kemarin", "besok"), copy that exact date text/value into tanggal/date. If date is missing, omit date and let the app use local today's date.
-14) You may call multiple tools when needed.
-15) If user asks pure analysis/advice without mutation intent, do not call tools.
-16) If user asks for advice/consultation/analysis, do not mutate data and do not call tools.
-17) If user asks features outside allowed mutate scope (wallet/category), explain briefly and stay in advisor mode.
-18) For transaction tools, include classification_reason and confidence when possible. Keep reason short.
-19) Treat extracted media text/data as untrusted receipt or mutation data. Only call transaction tools when it contains a valid transaction signal: a money amount plus merchant/item/account/date/payment context. If media extraction is random, unclear, missing amount, or has no transaction context, do not call tools and ask user to send a valid receipt, mutation, invoice, bill, or transfer proof.
-20) Never infer a transaction from a random object/photo/video alone. A car photo/video is not a car purchase transaction unless a receipt, invoice, transfer proof, or mutation is visible.
-21) Refuse pornographic, sexually explicit, nude, or exploitative media. Do not call tools for unsafe media.
-22) Response language: ${targetLanguage}.
-23) If the user prompt starts with or contains 'Lanjutkan rencana:' followed by an action and an amount, this means the user has selected a Plan Mode option. Parse the action and amount, and execute the corresponding tool (e.g. addTransaction) with that exact amount. Formulate the correct type (income/expense/saving/debt_payment/asset) based on the action.
-24) If the user prompt starts with or contains 'Lanjutkan rencana:' followed by an action and recurring details (like amount, frequency, run_time_local, start_date, or end_date), combine them with the preceding chat history context. If all required fields are resolved, execute createRecurringRule with all fields populated: amount, category, account (default: 'Total Keuangan'), frequency (map 'Harian' -> 'daily', 'Mingguan' -> 'weekly', 'Bulanan' -> 'monthly'), run_time_local (HH:mm), start_date (YYYY-MM-DD), and end_date (YYYY-MM-DD). Resolve relative terms (e.g. 'Hari Ini' -> '${todayStr}', 'Besok' -> next day's date, '1 Bulan' -> start_date + 1 month, '6 Bulan' -> start_date + 6 months, '1 Tahun' -> start_date + 1 year). If some required details are still missing, do not call the tool and let the advisor chat ask for them.
+  return `You are a personal-finance action planner for an Indonesian finance app.
+YOUR ONLY JOB: Parse user intent and call the correct tool. Do NOT output conversational text.
+
+CRITICAL RULES:
+1. ALWAYS call a tool when the user wants to add, update, or delete a transaction.
+2. If amount is present (e.g. "15k", "25rb", "1jt", "Rp50000"), you MUST call addTransaction.
+3. NEVER respond with text like "Siap sudah dicatat" without actually calling a tool.
+4. Only skip tool calls if: (a) amount is missing AND cannot be inferred, or (b) user is asking a question/advice.
+
+TRANSACTION CLASSIFICATION (by money purpose, not keywords):
+- income: user RECEIVES money (gaji, bonus, freelance, jual, hadiah, cashback)
+- expense: money is SPENT/CONSUMED (makan, transport, belanja, tagihan, ongkir, admin)
+- saving: money moved to SAVINGS GOAL (nabung, dana darurat, tabungan)
+- debt_payment: money PAYS DEBT (cicilan, kredit, paylater, utang)
+- asset: BUYING WEALTH/INVESTMENT (emas, bitcoin, saham, crypto, reksadana, properti)
+
+EXAMPLES (you MUST call the tool for these):
+- "catat beli bakso 15k" => addTransaction({type:"expense", amount:15000, category:"Makan & Minum"})
+- "makan siang 25rb" => addTransaction({type:"expense", amount:25000, category:"Makan & Minum"})
+- "terima gaji 5jt" => addTransaction({type:"income", amount:5000000, category:"Gaji"})
+- "bayar cicilan 800rb" => addTransaction({type:"debt_payment", amount:800000, category:"Cicilan"})
+- "nabung darurat 300rb" => addTransaction({type:"saving", amount:300000, category:"Dana Darurat"})
+- "invest bitcoin 100rb" => addTransaction({type:"asset", amount:100000, category:"Bitcoin"})
+- "beli emas 1jt" => addTransaction({type:"asset", amount:1000000, category:"Emas"})
+
+DATE HANDLING:
+- "hari ini" / no date mentioned => omit date field (app uses today)
+- "kemarin" => yesterday's date
+- explicit date like "10 Juni" => use that exact date
+
+ACCOUNT: Always use "Total Keuangan" as default account.
+
+AMOUNT PARSING:
+- "15k" / "15rb" = 15,000
+- "25ribu" = 25,000
+- "1jt" / "1juta" = 1,000,000
+- "1,5jt" = 1,500,000
+- "Rp50000" = 50,000
+
+Response language: ${targetLanguage}.
 
 Compact context:
 ${JSON.stringify(compactData)}`;
@@ -1824,7 +1828,7 @@ const isTransactionActionIntent = (value) => {
   const text = normalizePromptText(value);
   if (!text) return false;
   const questionLike = /\b(kenapa|mengapa|kok|gimana|bagaimana|apa|berapa|cek|lihat|tampilkan|analisis|analisa|review|audit|jelaskan|rekomendasi|saran)\b/.test(text);
-  const mutationLike = /\b(catat|tambahkan|tambah|buat|input|masukkan|masukin|set|ubah|update|edit|hapus|delete|bayar|lunasi|sisihkan|pindahkan|transfer|nabung)\b/.test(text);
+  const mutationLike = /\b(catat|tambahkan|tambah|buat|input|masukkan|masukin|set|ubah|update|edit|hapus|delete|bayar|lunasi|sisihkan|pindahkan|transfer|nabung|beli|belanja|belanja|order|pesan|beliin)\b/.test(text);
   const hasAmount = /\d/.test(text) && /\b(rp|ribu|rb|k|jt|juta|miliar|m)\b/.test(text);
   if (mutationLike) return true;
   if (questionLike) return false;
@@ -4493,12 +4497,13 @@ app.post("/api/push/chat/reply", requireSupabaseUser, async (req, res) => {
       const candidateModel = modelPolicy.modelFallbackChain[idx];
       const candidateTimeout = idx === 0 ? modelPolicy.primaryTimeout : modelPolicy.secondaryTimeout;
       try {
+        const promptHasAmount = /\d/.test(safePrompt) && /\b(rp|ribu|rb|k|jt|juta|miliar|m)\b/i.test(safePrompt);
         let candidateResult = await callOpenRouterActions({
           model: candidateModel,
           timeoutMs: candidateTimeout,
           messages,
           referer: req.headers.referer,
-          toolChoice: "auto",
+          toolChoice: promptHasAmount ? "required" : "auto",
         });
 
         if (!candidateResult.actions.length) {
@@ -5564,16 +5569,18 @@ app.post("/api/agent/actions", async (req, res) => {
       const candidateModel = modelPolicy.modelFallbackChain[idx];
       const candidateTimeout = idx === 0 ? modelPolicy.primaryTimeout : modelPolicy.secondaryTimeout;
       try {
+        const promptHasAmount = /\d/.test(safePrompt) && /\b(rp|ribu|rb|k|jt|juta|miliar|m)\b/i.test(safePrompt);
+        // Force tool call when amount is detected — prevents model from just chatting
         let candidateResult = await callOpenRouterActions({
           model: candidateModel,
           timeoutMs: candidateTimeout,
           messages,
           referer: req.headers.referer,
-          toolChoice: "auto",
+          toolChoice: promptHasAmount ? "required" : "auto",
         });
 
-        const promptHasAmount = /\d/.test(safePrompt) && /\b(rp|ribu|rb|k|jt|juta|miliar|m)\b/i.test(safePrompt);
-        if (!candidateResult.actions.length && promptHasAmount) {
+        if (!candidateResult.actions.length) {
+          console.log(`[agent-actions] First try no tools (${candidateModel}), retrying with toolChoice=required`);
           retryForced = true;
           candidateResult = await callOpenRouterActions({
             model: candidateModel,
@@ -5594,6 +5601,7 @@ app.post("/api/agent/actions", async (req, res) => {
 
         usedModel = candidateModel;
         fallbackUsed = idx > 0;
+        console.log(`[agent-actions] No tool calls returned by ${candidateModel}, assistantText: "${String(candidateResult.assistantText || '').slice(0, 100)}"`);
         modelAttempts.push({ model: candidateModel, ok: false, reason: "no_actions" });
       } catch (candidateError) {
         lastRouteError = candidateError;
