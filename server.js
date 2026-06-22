@@ -1607,7 +1607,7 @@ const resolveAiRouteModelPolicy = ({ route, prompt, accessPlan, hasAttachments }
   }
 
   if (planTier === "free") {
-    const modelFallbackChain = uniqueModelChain(hasAttachments ? [freeModel] : [freeModel, paidModel]);
+    const modelFallbackChain = uniqueModelChain(hasAttachments ? [freeModel, sanitizeModelId(OPENROUTER_MODEL_FREE, DEFAULT_FREE_MODEL)] : [freeModel, paidModel]);
     return {
       planTier,
       intent: base.intent,
@@ -1620,7 +1620,7 @@ const resolveAiRouteModelPolicy = ({ route, prompt, accessPlan, hasAttachments }
     };
   }
 
-  const modelFallbackChain = uniqueModelChain(hasAttachments ? [paidModel] : [paidModel, freeModel]);
+  const modelFallbackChain = uniqueModelChain(hasAttachments ? [paidModel, sanitizePaidModelId(OPENROUTER_MODEL_PAID, DEFAULT_PAID_MODEL, "OPENROUTER_MODEL_PAID")] : [paidModel, freeModel]);
 
   return {
     planTier,
