@@ -4500,7 +4500,7 @@ app.post("/api/push/chat/reply", requireSupabaseUser, async (req, res) => {
       const candidateModel = modelPolicy.modelFallbackChain[idx];
       const candidateTimeout = idx === 0 ? modelPolicy.primaryTimeout : modelPolicy.secondaryTimeout;
       try {
-        const promptHasAmount = /\d/.test(safePrompt) && /\b(rp|ribu|rb|k|jt|juta|miliar|m)\b/i.test(safePrompt);
+        const promptHasAmount = /\d/.test(replyText) && /\b(rp|ribu|rb|k|jt|juta|miliar|m)\b/i.test(replyText);
         let candidateResult = await callOpenRouterActions({
           model: candidateModel,
           timeoutMs: candidateTimeout,
@@ -4527,6 +4527,15 @@ app.post("/api/push/chat/reply", requireSupabaseUser, async (req, res) => {
         }
       } catch (err) {
         lastRouteError = err;
+      }
+    }
+
+    // TEXT-BASED FALLBACK for push reply
+    if ((!result.actions || !result.actions.length) && result.assistantText) {
+      const extractedFromText = extractActionsFromModelText(result.assistantText, replyText);
+      if (extractedFromText.length) {
+        console.log(`[push-reply] Fallback extracted ${extractedFromText.length} action(s) from model text`);
+        result.actions = extractedFromText;
       }
     }
 
@@ -5476,6 +5485,137 @@ app.delete("/api/family/delete", requireSupabaseUser, async (req, res) => {
   }
 });
 
+/**
+ * Fallback: extract actions from model's text response when tool_calls are not returned.
+ * Handles JSON action objects, function-call syntax, and JSON-in-text patterns.
+ */
+const extractActionsFromModelText = (text, originalPrompt) => {
+  if (!text || typeof text !== "string") return [];
+  const results = [];
+
+  // Strategy 1: Try to parse the entire text as JSON (array or single action)
+  const parsed = parseJsonObject(text);
+  if (parsed) {
+    const items = Array.isArray(parsed) ? parsed : [parsed];
+    for (const item of items) {
+      if (item && typeof item === "object") {
+        const name = String(item.name || item.function || item.action || "").trim();
+        const args = isObject(item.args || item.parameters || item.arguments) ? (item.args || item.parameters || item.arguments) : (typeof item === "object" && !item.name ? item : null);
+        if (name && AGENT_ALLOWED_ACTIONS.has(name) && isObject(args)) {
+          results.push({ name, args });
+        }
+      }
+    }
+    if (results.length) return results.slice(0, 5);
+  }
+
+  // Strategy 2: Look for JSON blocks inside markdown code fences
+  const codeBlockRegex = /```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/gi;
+  let match;
+  while ((match = codeBlockRegex.exec(text)) !== null) {
+    const inner = parseJsonObject(match[1]);
+    if (inner) {
+      const items = Array.isArray(inner) ? inner : [inner];
+      for (const item of items) {
+        if (item && typeof item === "object") {
+          const name = String(item.name || item.function || item.action || "").trim();
+          const args = isObject(item.args || item.parameters || item.arguments) ? (item.args || item.parameters || item.arguments) : null;
+          if (name && AGENT_ALLOWED_ACTIONS.has(name) && isObject(args)) {
+            results.push({ name, args });
+          }
+        }
+      }
+    }
+  }
+  if (results.length) return results.slice(0, 5);
+
+  // Strategy 3: Look for inline JSON objects in text
+  const jsonRegex = /\{[^{}]*"(?:name|type|amount)"[^{}]*\}/g;
+  const jsonMatches = text.match(jsonRegex) || [];
+  for (const jsonStr of jsonMatches) {
+    const obj = parseJsonObject(jsonStr);
+    if (obj) {
+      const name = String(obj.name || "").trim();
+      if (name && AGENT_ALLOWED_ACTIONS.has(name) && isObject(obj.args || obj)) {
+        results.push({ name, args: obj.args || obj });
+      }
+    }
+  }
+  if (results.length) return results.slice(0, 5);
+
+  // Strategy 4: Look for function-call-like patterns: functionName({...})
+  const funcCallRegex = /\b(addTransaction|createTransaction|updateTransaction|deleteTransaction|createBudget|updateBudget|deleteBudget|createTabungan|addTabungan|createGoal|createCategory)\s*\(\s*(\{[\s\S]*?\})\s*\)/gi;
+  let funcMatch;
+  while ((funcMatch = funcCallRegex.exec(text)) !== null) {
+    const name = funcMatch[1];
+    const args = parseJsonObject(funcMatch[2]);
+    if (name && AGENT_ALLOWED_ACTIONS.has(name) && isObject(args)) {
+      results.push({ name, args });
+    }
+  }
+  if (results.length) return results.slice(0, 5);
+
+  // Strategy 5: Prompt-based heuristic fallback for addTransaction
+  const prompt = normalizePromptText(originalPrompt);
+  if (prompt) {
+    const hasMutationIntent = /\b(catat|tambahkan|tambah|buat|input|masukkan|masukin|bayar|lunasi|sisihkan|nabung|beli)\b/.test(prompt);
+    const amount = parseAmount(originalPrompt);
+    if (hasMutationIntent && amount > 0) {
+      // Infer transaction type from prompt keywords
+      let type = "expense";
+      let category = null;
+      if (/\b(terima|gaji|bonus|freelance|hasil jual|profit|untung|dividen|cashback|masuk)\b/.test(prompt)) {
+        type = "income";
+        category = "Gaji";
+      } else if (/\b(nabung|tabung|dana darurat|sisihkan)\b/.test(prompt)) {
+        type = "saving";
+        category = "Dana Darurat";
+      } else if (/\b(cicilan|kredit|paylater|utang|bayar utang)\b/.test(prompt)) {
+        type = "debt_payment";
+        category = "Cicilan";
+      } else if (shouldCoerceExpenseToAsset(originalPrompt)) {
+        type = "asset";
+        category = inferAssetCategoryFromPrompt(originalPrompt);
+      }
+
+      // Try to extract a category from the prompt
+      if (!category) {
+        // Look for common food/shopping keywords
+        if (/\b(makan|minum|bakso|nasi|mie|kopi|teh|jus|ayam|ikan|sate|rendang|soto|gado)\b/.test(prompt)) category = "Makanan";
+        else if (/\b(transport|ojek|grab|gojek|bensin|parkir|toll|bus|kereta|pesawat|taksi)\b/.test(prompt)) category = "Transportasi";
+        else if (/\b(belanja|beli|tokopedia|shopee|lazada|market)\b/.test(prompt)) category = "Belanja";
+        else if (/\b(listrik|air|internet|wifi|pulsa|token)\b/.test(prompt)) category = "Tagihan";
+        else if (/\b(hiburan|nonton|game|netflix|spotify)\b/.test(prompt)) category = "Hiburan";
+        else category = "Lainnya";
+      }
+
+      // Extract description from prompt (remove common prefixes)
+      const description = originalPrompt
+        .replace(/\b(catat|tambahkan|tambah|buat|input|masukkan|masukin)\b/gi, "")
+        .replace(/\b\d+[kK]?\b/g, "")
+        .replace(/\brp\.?\s*\d+/gi, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 120) || `${type} transaction`;
+
+      results.push({
+        name: "addTransaction",
+        args: {
+          type,
+          amount,
+          category: category || "Lainnya",
+          description,
+          account: "Total Keuangan",
+          confidence: 0.6,
+          classification_reason: "Diekstrak dari teks karena model tidak mengembalikan tool_call",
+        },
+      });
+    }
+  }
+
+  return results.slice(0, 5);
+};
+
 app.post("/api/agent/actions", async (req, res) => {
   const started = Date.now();
   let safePrompt = "";
@@ -5621,6 +5761,15 @@ app.post("/api/agent/actions", async (req, res) => {
     }
 
     if (!result.actions.length && lastRouteError) throw lastRouteError;
+
+    // TEXT-BASED FALLBACK: If model returned text but no tool_calls, try to extract actions from text
+    if (!result.actions.length && result.assistantText) {
+      const extractedFromText = extractActionsFromModelText(result.assistantText, safePrompt);
+      if (extractedFromText.length) {
+        console.log(`[agent-actions] Fallback extracted ${extractedFromText.length} action(s) from model text`);
+        result.actions = extractedFromText;
+      }
+    }
 
     if (!result.actions.length) {
       return res.status(422).json({
