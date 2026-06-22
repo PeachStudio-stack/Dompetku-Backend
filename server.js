@@ -54,17 +54,45 @@ const assertOpenRouterKey = () => {
   }
 };
 const logAiRoute = (route, details = {}) => {
-  console.log(
-    "[ai-route]",
-    JSON.stringify({
-      route,
-      hasOpenRouterKey: hasOpenRouterKey(),
-      modelPaid: OPENROUTER_MODEL_PAID,
-      modelFree: OPENROUTER_MODEL_FREE,
-      modelReport: OPENROUTER_MODEL_REPORT_RECOMMENDATION,
-      ...details,
-    })
-  );
+  const d = details;
+  const tier = d.plan_tier || d.accessPlan || '-';
+  const model = d.model || d.model_primary || '-';
+  const fallback = Array.isArray(d.model_fallback_chain) ? d.model_fallback_chain.join(' → ') : '-';
+  const chars = d.input_chars || d.inputChars || 0;
+  const attach = Array.isArray(d.attachments) ? d.attachments.length : 0;
+  const intent = d.intent || '-';
+  const parts = [
+    `[${route}]`,
+    `plan=${tier}`,
+    `model=${model}`,
+    `input=${chars}ch`,
+  ];
+  if (intent !== '-') parts.push(`intent=${intent}`);
+  if (attach > 0) parts.push(`attach=${attach}`);
+  if (fallback !== '-') parts.push(`fallback=[${fallback}]`);
+  console.log(parts.join(' | '));
+};
+
+const logAiResponse = (route, details = {}) => {
+  const d = details;
+  const model = d.model_used || '-';
+  const ttft = d.ttft_ms != null ? `${d.ttft_ms}ms` : '-';
+  const total = d.total_ms != null ? `${d.total_ms}ms` : '-';
+  const inTokens = d.input_tokens_est != null ? d.input_tokens_est : '-';
+  const outTokens = d.output_tokens_est != null ? d.output_tokens_est : '-';
+  const fallback = d.fallback_used ? 'YES' : 'no';
+  const status = d.error ? 'FAIL' : 'OK';
+  const parts = [
+    `[${route}]`,
+    `status=${status}`,
+    `model=${model}`,
+    `ttft=${ttft}`,
+    `total=${total}`,
+    `tokens≈${inTokens}→${outTokens}`,
+  ];
+  if (d.fallback_used != null) parts.push(`fallback=${fallback}`);
+  if (d.error) parts.push(`err=${String(d.error).slice(0, 80)}`);
+  console.log(parts.join(' | '));
 };
 
 const resolveGoogleServiceAccount = () => {
@@ -1577,6 +1605,9 @@ const resolveAiRouteModelPolicy = ({ route, prompt, accessPlan, hasAttachments }
   if (route === "agent_actions") {
     freeModel = sanitizeModelId(OPENROUTER_MODEL_ACTIONS_FREE, "google/gemini-2.5-flash:free");
     paidModel = sanitizePaidModelId(OPENROUTER_MODEL_ACTIONS_PAID, "google/gemini-2.5-flash", "OPENROUTER_MODEL_ACTIONS_PAID");
+  } else if (route === "quick_suggestions") {
+    freeModel = sanitizePaidModelId(OPENROUTER_MODEL_PAID, DEFAULT_PAID_MODEL, "OPENROUTER_MODEL_PAID");
+    paidModel = sanitizeModelId(OPENROUTER_MODEL_QUICK_SUGGEST, DEFAULT_FREE_MODEL);
   } else if (hasAttachments) {
     freeModel = sanitizeModelId(OPENROUTER_MODEL_VISION_FREE, "minimax/minimax-m3");
     paidModel = sanitizePaidModelId(OPENROUTER_MODEL_VISION_PAID, "minimax/minimax-m3", "OPENROUTER_MODEL_VISION_PAID");
@@ -1590,7 +1621,7 @@ const resolveAiRouteModelPolicy = ({ route, prompt, accessPlan, hasAttachments }
   }
 
   if (planTier === "free") {
-    const modelFallbackChain = uniqueModelChain([freeModel]);
+    const modelFallbackChain = uniqueModelChain(hasAttachments ? [freeModel] : [freeModel, paidModel]);
     return {
       planTier,
       intent: base.intent,
@@ -1603,7 +1634,7 @@ const resolveAiRouteModelPolicy = ({ route, prompt, accessPlan, hasAttachments }
     };
   }
 
-  const modelFallbackChain = uniqueModelChain([paidModel]);
+  const modelFallbackChain = uniqueModelChain(hasAttachments ? [paidModel] : [paidModel, freeModel]);
 
   return {
     planTier,
@@ -5709,6 +5740,14 @@ app.post("/api/agent/actions", async (req, res) => {
       });
     }
 
+    logAiResponse("/api/agent/actions", {
+      model_used: usedModel,
+      total_ms: Date.now() - started,
+      input_tokens_est: estimateTokens(safePrompt),
+      output_tokens_est: estimateTokens(result.assistantText || ''),
+      fallback_used: fallbackUsed,
+    });
+
     return res.json({
       ok: true,
       actions: directActions,
@@ -6010,16 +6049,12 @@ ${turnsText}`;
 
     if (!summary && lastRouteError) throw lastRouteError;
 
-    console.log(
-      "[latency]",
-      JSON.stringify({
-        route: "/api/chat/memory-summary",
-        total_ms: Date.now() - started,
-        input_chars: prompt.length,
-        output_tokens_est: estimateTokens(summary),
-        model_used: usedModel,
-      })
-    );
+    logAiResponse("/api/chat/memory-summary", {
+      model_used: usedModel,
+      total_ms: Date.now() - started,
+      input_tokens_est: estimateTokens(prompt),
+      output_tokens_est: estimateTokens(summary),
+    });
 
     return res.json({
       summary: summary || previousSummary,
@@ -6206,18 +6241,14 @@ app.post("/api/chat", async (req, res) => {
     const textWithoutJson = String(aiText || "")
       .replace(/\`\`\`json\n?[\s\S]*?\n?\`\`\`/g, "")
       .trim();
-    console.log(
-      "[latency]",
-      JSON.stringify({
-        route: "/api/chat",
-        ttft_ms: timing.ttftMs,
-        total_ms: Date.now() - started,
-        input_chars: String(prompt || "").length,
-        output_tokens_est: estimateTokens(aiText),
-        model_used: usedModel,
-        fallback_used: fallbackUsed,
-      })
-    );
+    logAiResponse("/api/chat", {
+      model_used: usedModel,
+      ttft_ms: timing.ttftMs,
+      total_ms: Date.now() - started,
+      input_tokens_est: estimateTokens(prompt),
+      output_tokens_est: estimateTokens(aiText),
+      fallback_used: fallbackUsed,
+    });
     res.json({
       text: textWithoutJson,
       metadata: {
@@ -6235,6 +6266,7 @@ app.post("/api/chat", async (req, res) => {
       },
     });
   } catch (error) {
+    logAiResponse("/api/chat", { error: error?.message || error });
     if (getAiErrorCode(error) !== "unknown") {
       const status = getAiErrorCode(error) === "rate_limited" ? 429 : 503;
       return res.status(status).json({
@@ -6242,7 +6274,6 @@ app.post("/api/chat", async (req, res) => {
         error_code: getAiErrorCode(error),
       });
     }
-    console.error("AI Proxy Error:", error);
     res.status(500).json({ error: error?.message || "Unknown error" });
   }
 });
@@ -6397,18 +6428,14 @@ app.post("/api/chat/stream", async (req, res) => {
     const textWithoutJson = String(fullText || "")
       .replace(/\`\`\`json\n?[\s\S]*?\n?\`\`\`/g, "")
       .trim();
-    console.log(
-      "[latency]",
-      JSON.stringify({
-        route: "/api/chat/stream",
-        ttft_ms: ttftMs,
-        total_ms: Date.now() - started,
-        input_chars: String(prompt || "").length,
-        output_tokens_est: estimateTokens(fullText),
-        model_used: usedModel,
-        fallback_used: fallbackUsed,
-      })
-    );
+    logAiResponse("/api/chat/stream", {
+      model_used: usedModel,
+      ttft_ms: ttftMs,
+      total_ms: Date.now() - started,
+      input_tokens_est: estimateTokens(prompt),
+      output_tokens_est: estimateTokens(fullText),
+      fallback_used: fallbackUsed,
+    });
 
     sendEvent("done", {
       fullText: textWithoutJson,
@@ -6531,6 +6558,13 @@ Rules:
       : [];
 
     if (!suggestions.length) throw new Error("No suggestions returned");
+    logAiResponse("/api/quick-suggestions", {
+      model_used: usedModel,
+      total_ms: Date.now() - started,
+      input_tokens_est: estimateTokens(prompt),
+      output_tokens_est: estimateTokens(textResult),
+      fallback_used: fallbackUsed,
+    });
     return res.json({
       suggestions,
       metadata: {
@@ -6544,6 +6578,7 @@ Rules:
       },
     });
   } catch (error) {
+    logAiResponse("/api/quick-suggestions", { error: error?.message || error });
     if (getAiErrorCode(error) !== "unknown") {
       const status = getAiErrorCode(error) === "rate_limited" ? 429 : 503;
       return res.status(status).json({ error: getAiUserFacingMessage(error), error_code: getAiErrorCode(error) });
