@@ -26,19 +26,8 @@ const PORT = Number(process.env.PORT || 3000);
 const OPENROUTER_URL = process.env.OPENROUTER_URL || "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const OPENROUTER_MODEL_PAID = process.env.OPENROUTER_MODEL_PAID || "xiaomi/mimo-v2.5-pro";
-const OPENROUTER_MODEL_QUICK_SUGGEST =
-  process.env.OPENROUTER_MODEL_QUICK_SUGGEST || "deepseek/deepseek-v4-flash";
-const OPENROUTER_MODEL_FREE = process.env.OPENROUTER_MODEL_FREE || "deepseek/deepseek-v4-flash";
-const OPENROUTER_MODEL_REPORT_RECOMMENDATION =
-  process.env.OPENROUTER_MODEL_REPORT_RECOMMENDATION || "deepseek/deepseek-v4-flash";
-const OPENROUTER_MODEL_VISION_FREE =
-  process.env.OPENROUTER_MODEL_VISION_FREE || "minimax/minimax-m3";
-const OPENROUTER_MODEL_VISION_PAID =
-  process.env.OPENROUTER_MODEL_VISION_PAID || "minimax/minimax-m3";
-const OPENROUTER_MODEL_ACTIONS_FREE =
-  process.env.OPENROUTER_MODEL_ACTIONS_FREE || "google/gemini-2.5-flash:free";
-const OPENROUTER_MODEL_ACTIONS_PAID =
-  process.env.OPENROUTER_MODEL_ACTIONS_PAID || "google/gemini-2.5-flash";
+const OPENROUTER_MODEL_FREE = process.env.OPENROUTER_MODEL_FREE || "xiaomi/mimo-v2.5";
+const OPENROUTER_MODEL_VISION = process.env.OPENROUTER_MODEL_VISION || "minimax/minimax-m3";
 const OPENROUTER_TIMEOUT_FREE_MS = Number(process.env.OPENROUTER_TIMEOUT_FREE_MS || process.env.OPENROUTER_TIMEOUT_FAST_MS || 12000);
 const OPENROUTER_TIMEOUT_PAID_MS = Number(process.env.OPENROUTER_TIMEOUT_PAID_MS || process.env.OPENROUTER_TIMEOUT_HEAVY_MS || 25000);
 const MAX_CHAT_ATTACHMENT_BYTES = Math.min(
@@ -1603,14 +1592,11 @@ const resolveAiRouteModelPolicy = ({ route, prompt, accessPlan, hasAttachments }
   let paidModel = sanitizePaidModelId(OPENROUTER_MODEL_PAID, DEFAULT_PAID_MODEL, "OPENROUTER_MODEL_PAID");
 
   if (route === "agent_actions") {
-    freeModel = sanitizeModelId(OPENROUTER_MODEL_ACTIONS_FREE, "google/gemini-2.5-flash:free");
-    paidModel = sanitizePaidModelId(OPENROUTER_MODEL_ACTIONS_PAID, "google/gemini-2.5-flash", "OPENROUTER_MODEL_ACTIONS_PAID");
-  } else if (route === "quick_suggestions") {
-    freeModel = sanitizePaidModelId(OPENROUTER_MODEL_PAID, DEFAULT_PAID_MODEL, "OPENROUTER_MODEL_PAID");
-    paidModel = sanitizeModelId(OPENROUTER_MODEL_QUICK_SUGGEST, DEFAULT_FREE_MODEL);
+    freeModel = sanitizeModelId(OPENROUTER_MODEL_FREE, DEFAULT_FREE_MODEL);
+    paidModel = sanitizePaidModelId(OPENROUTER_MODEL_PAID, DEFAULT_PAID_MODEL, "OPENROUTER_MODEL_PAID");
   } else if (hasAttachments) {
-    freeModel = sanitizeModelId(OPENROUTER_MODEL_VISION_FREE, "minimax/minimax-m3");
-    paidModel = sanitizePaidModelId(OPENROUTER_MODEL_VISION_PAID, "minimax/minimax-m3", "OPENROUTER_MODEL_VISION_PAID");
+    freeModel = sanitizeModelId(OPENROUTER_MODEL_VISION, "minimax/minimax-m3");
+    paidModel = sanitizePaidModelId(OPENROUTER_MODEL_VISION, "minimax/minimax-m3", "OPENROUTER_MODEL_VISION");
   }
 
   let maxTokens = 500;
@@ -1686,13 +1672,19 @@ const resolveAccessModelPlan = (prompt, accessPlan) => {
 
 // Startup guard rails for paid model configuration.
 sanitizePaidModelId(OPENROUTER_MODEL_PAID, DEFAULT_PAID_MODEL, "OPENROUTER_MODEL_PAID");
-sanitizePaidModelId(OPENROUTER_MODEL_ACTIONS_PAID, "google/gemini-2.5-flash", "OPENROUTER_MODEL_ACTIONS_PAID");
 
 const compactObject = (obj = {}) =>
   Object.fromEntries(Object.entries(obj).filter(([, value]) => Number(value) !== 0));
 
 const buildCompactData = (currentData) => ({
   metadata: currentData?.metadata || {},
+  categories: {
+    income: currentData?.categories?.income || [],
+    expense: currentData?.categories?.expenses || currentData?.categories?.expense || [],
+    saving: currentData?.categories?.saving || [],
+    debt_payment: currentData?.categories?.debt_payment || currentData?.categories?.debts || [],
+    asset: currentData?.categories?.assets || currentData?.categories?.asset || [],
+  },
   personalFinance: {
     income: compactObject(currentData?.income || currentData?.accounts?.revenue || {}),
     expenses: compactObject(currentData?.expenses || currentData?.accounts?.expenses || {}),
@@ -1772,6 +1764,12 @@ ${JSON.stringify(compactData)}`;
 
 const buildActionSystemInstruction = (targetLanguage, compactData) => {
   const todayStr = getLocalUsageDate();
+  const categories = compactData?.categories || {};
+  const expenseCategories = (categories.expense || []).join(', ');
+  const incomeCategories = (categories.income || []).join(', ');
+  const savingCategories = (categories.saving || []).join(', ');
+  const debtCategories = (categories.debt_payment || []).join(', ');
+  const assetCategories = (categories.asset || []).join(', ');
   return `You are a personal-finance action planner for an Indonesian finance app.
 YOUR ONLY JOB: Parse user intent and call the correct tool. Do NOT output conversational text.
 
@@ -1781,6 +1779,18 @@ CRITICAL RULES:
 3. NEVER respond with text like "Siap sudah dicatat" without actually calling a tool.
 4. Only skip tool calls if: (a) amount is missing AND cannot be inferred, or (b) user is asking a question/advice.
 
+CATEGORY RULES (VERY IMPORTANT):
+- You MUST use EXACTLY the category names from the user's category list below.
+- Do NOT invent new category names. If unsure, use the closest matching category from the list.
+- If the user mentions a category not in the list, use the most similar one.
+
+USER'S CATEGORIES:
+- Expense: ${expenseCategories || 'Makanan, Transportasi, Belanja, Hiburan, Lainnya'}
+- Income: ${incomeCategories || 'Gaji, Freelance, Bonus, Lainnya'}
+- Saving: ${savingCategories || 'Dana Darurat, Tabungan, Lainnya'}
+- Debt Payment: ${debtCategories || 'Cicilan, Kartu Kredit, Lainnya'}
+- Asset: ${assetCategories || 'Emas, Bitcoin, Investasi, Lainnya'}
+
 TRANSACTION CLASSIFICATION (by money purpose, not keywords):
 - income: user RECEIVES money (gaji, bonus, freelance, jual, hadiah, cashback)
 - expense: money is SPENT/CONSUMED (makan, transport, belanja, tagihan, ongkir, admin)
@@ -1789,8 +1799,8 @@ TRANSACTION CLASSIFICATION (by money purpose, not keywords):
 - asset: BUYING WEALTH/INVESTMENT (emas, bitcoin, saham, crypto, reksadana, properti)
 
 EXAMPLES (you MUST call the tool for these):
-- "catat beli bakso 15k" => addTransaction({type:"expense", amount:15000, category:"Makan & Minum"})
-- "makan siang 25rb" => addTransaction({type:"expense", amount:25000, category:"Makan & Minum"})
+- "catat beli bakso 15k" => addTransaction({type:"expense", amount:15000, category:"Makanan"})
+- "makan siang 25rb" => addTransaction({type:"expense", amount:25000, category:"Makanan"})
 - "terima gaji 5jt" => addTransaction({type:"income", amount:5000000, category:"Gaji"})
 - "bayar cicilan 800rb" => addTransaction({type:"debt_payment", amount:800000, category:"Cicilan"})
 - "nabung darurat 300rb" => addTransaction({type:"saving", amount:300000, category:"Dana Darurat"})
@@ -4236,8 +4246,6 @@ const makeLimiter = (max, scope) =>
 
 app.use("/api/chat", makeLimiter(RATE_LIMIT_CHAT_MAX, "chat"));
 app.use("/api/chat/stream", makeLimiter(RATE_LIMIT_CHAT_MAX, "chat_stream"));
-app.use("/api/attachments/ocr", makeLimiter(Math.max(5, Math.floor(RATE_LIMIT_CHAT_MAX / 2)), "attachment_ocr"));
-app.use("/api/quick-suggestions", makeLimiter(RATE_LIMIT_QUICK_MAX, "quick_suggestions"));
 app.use("/api/iap", makeLimiter(RATE_LIMIT_IAP_MAX, "iap"));
 
 app.get("/health", (_req, res) => {
@@ -4255,9 +4263,7 @@ app.get("/health", (_req, res) => {
     models: {
       paid: OPENROUTER_MODEL_PAID,
       free: OPENROUTER_MODEL_FREE,
-      report: OPENROUTER_MODEL_REPORT_RECOMMENDATION,
-      actionsPaid: OPENROUTER_MODEL_ACTIONS_PAID,
-      actionsFree: OPENROUTER_MODEL_ACTIONS_FREE,
+      vision: OPENROUTER_MODEL_VISION,
     },
   });
 });
@@ -4268,10 +4274,7 @@ app.get("/api/health/ai", (_req, res) => {
     hasOpenRouterKey: hasOpenRouterKey(),
     modelPaid: OPENROUTER_MODEL_PAID,
     modelFree: OPENROUTER_MODEL_FREE,
-    modelReport: OPENROUTER_MODEL_REPORT_RECOMMENDATION,
-    modelQuickSuggest: OPENROUTER_MODEL_QUICK_SUGGEST,
-    modelActionsPaid: OPENROUTER_MODEL_ACTIONS_PAID,
-    modelActionsFree: OPENROUTER_MODEL_ACTIONS_FREE,
+    modelVision: OPENROUTER_MODEL_VISION,
     nodeEnv: process.env.NODE_ENV || "development",
   });
 });
@@ -6471,127 +6474,6 @@ app.post("/api/chat/stream", async (req, res) => {
     console.error("AI Stream Error:", error);
     sendEvent("error", { message: error?.message || "Streaming failed" });
     res.end();
-  }
-});
-
-app.post("/api/quick-suggestions", async (req, res) => {
-  try {
-    const { text, language, accessPlan: clientAccessPlan } = req.body || {};
-    // Server-side subscription verification
-    let accessPlan = clientAccessPlan || "free";
-    const bearerToken = getBearerTokenFromRequest(req);
-    if (bearerToken) {
-      try {
-        const authUser = await verifySupabaseUserAccessToken(bearerToken);
-        if (authUser?.id) {
-          const dbPlan = await resolveUserAccessPlanFromDB(authUser.id);
-          if (dbPlan !== null) accessPlan = dbPlan;
-        }
-      } catch (_authErr) { /* non-authed request */ }
-    }
-    const query = String(text || "").trim();
-    if (!query) return res.json({ suggestions: [] });
-    if (query.length > MAX_PROMPT_CHARS) {
-      return res.status(400).json({ error: `Input terlalu panjang. Maksimal ${MAX_PROMPT_CHARS} karakter.` });
-    }
-
-    const prompt = `User is typing this request: "${query}".
-Generate exactly 3 short quick suggestions for a personal finance assistant app.
-Rules:
-- Language: ${language || "Indonesian"}
-- Each suggestion must be max 40 characters
-- Practical and directly actionable
-- No numbering, no markdown, no explanation
-- Return valid JSON object only: {"suggestions":["...","...","..."]}`;
-    const modelPolicy = resolveAiRouteModelPolicy({
-      route: "quick_suggestions",
-      prompt: query,
-      accessPlan,
-    });
-    let usedModel = modelPolicy.primaryModel;
-    let fallbackUsed = false;
-    logAiRoute("/api/quick-suggestions", {
-      accessPlan: accessPlan || "free",
-      inputChars: query.length,
-      plan_tier: modelPolicy.planTier,
-      model: modelPolicy.primaryModel,
-      model_primary: modelPolicy.primaryModel,
-      model_fallback_chain: modelPolicy.fallbackModels,
-    });
-
-    let result = null;
-    let lastRouteError = null;
-    const modelAttempts = [];
-    for (let idx = 0; idx < modelPolicy.modelFallbackChain.length; idx += 1) {
-      const candidateModel = modelPolicy.modelFallbackChain[idx];
-      try {
-        result = await callOpenRouterText({
-          model: candidateModel,
-          timeoutMs: 12000,
-          maxTokens: 120,
-          referer: req.headers.referer,
-          messages: [{ role: "user", content: prompt }],
-        });
-        usedModel = candidateModel;
-        fallbackUsed = idx > 0;
-        modelAttempts.push({ model: candidateModel, ok: true });
-        break;
-      } catch (candidateError) {
-        lastRouteError = candidateError;
-        modelAttempts.push({
-          model: candidateModel,
-          ok: false,
-          reason: getAiErrorCode(candidateError),
-          retriable: isRetriableAiError(candidateError),
-        });
-        if (!isRetriableAiError(candidateError)) break;
-      }
-    }
-    if (!result && lastRouteError) throw lastRouteError;
-
-    let parsed = null;
-    const textResult = String(result?.text || "").trim();
-    try {
-      parsed = JSON.parse(textResult);
-    } catch {
-      const match = textResult.match(/\{[\s\S]*\}/);
-      if (match) parsed = JSON.parse(match[0]);
-    }
-
-    const suggestions = Array.isArray(parsed?.suggestions)
-      ? parsed.suggestions
-          .map((v) => String(v || "").trim().slice(0, 40))
-          .filter(Boolean)
-          .slice(0, 3)
-      : [];
-
-    if (!suggestions.length) throw new Error("No suggestions returned");
-    logAiResponse("/api/quick-suggestions", {
-      model_used: usedModel,
-      total_ms: Date.now() - started,
-      input_tokens_est: estimateTokens(prompt),
-      output_tokens_est: estimateTokens(textResult),
-      fallback_used: fallbackUsed,
-    });
-    return res.json({
-      suggestions,
-      metadata: {
-        model_used: usedModel,
-        model_primary: modelPolicy.primaryModel,
-        model_fallback_chain: modelPolicy.fallbackModels,
-        plan_tier: modelPolicy.planTier,
-        final_model_used: usedModel,
-        fallback_used: fallbackUsed,
-        model_attempts: modelAttempts,
-      },
-    });
-  } catch (error) {
-    logAiResponse("/api/quick-suggestions", { error: error?.message || error });
-    if (getAiErrorCode(error) !== "unknown") {
-      const status = getAiErrorCode(error) === "rate_limited" ? 429 : 503;
-      return res.status(status).json({ error: getAiUserFacingMessage(error), error_code: getAiErrorCode(error) });
-    }
-    return res.status(503).json({ error: error?.message || "Quick suggestions unavailable" });
   }
 });
 
